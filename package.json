@@ -1,0 +1,54 @@
+{
+  "name": "zcode-mcp",
+  "version": "0.1.0",
+  "description": "Expose the zcode coding agent as MCP tools, so external agents (Codex, Claude Code, ...) can delegate development tasks to zcode.",
+  "type": "module",
+  "bin": {
+    "zcode-mcp": "dist/index.js"
+  },
+  "main": "dist/index.js",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/TechYan/zcode_mcp.git"
+  },
+  "bugs": {
+    "url": "https://github.com/TechYan/zcode_mcp/issues"
+  },
+  "homepage": "https://github.com/TechYan/zcode_mcp#readme",
+  "scripts": {
+    "build": "tsc",
+    "start": "node dist/index.js",
+    "test": "node --test \"test/*.test.mjs\"",
+    "dev:probe": "node scripts/probe.mjs",
+    "dev:e2e": "node scripts/e2e.mjs"
+  },
+  "keywords": [
+    "mcp",
+    "zcode",
+    "coding-agent",
+    "glm",
+    "codex",
+    "claude-code",
+    "agent-orchestration"
+  ],
+  "author": "TechYan",
+  "license": "MIT",
+  "engines": {
+    "node": ">=18"
+  },
+  "files": [
+    "dist",
+    "src",
+    "scripts",
+    "README.md",
+    "LICENSE"
+  ],
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.12.0",
+    "zod": "^3.24.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.20.4",
+    "typescript": "^5.6.0"
+  }
+}
