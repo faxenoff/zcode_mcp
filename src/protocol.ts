@@ -25,11 +25,14 @@ import {
   realpathSync,
 } from "node:fs";
 import { arch, homedir, platform, userInfo } from "node:os";
-import { dirname, join } from "node:path";
+import { dirname, isAbsolute, join } from "node:path";
 import { createHash, createDecipheriv } from "node:crypto";
 import { EventEmitter } from "node:events";
 
-export const DEFAULT_ZCODE_BIN = "/Applications/ZCode.app/Contents/Resources/glm/zcode.cjs";
+export const DEFAULT_ZCODE_BIN =
+  platform() === "win32"
+    ? join(process.env.LOCALAPPDATA ?? join(homedir(), "AppData/Local"), "Programs/ZCode/resources/glm/zcode.cjs")
+    : "/Applications/ZCode.app/Contents/Resources/glm/zcode.cjs";
 
 const ACCOUNT_PROVIDERS = [
   "account:zai-individual-coding-plan",
@@ -118,7 +121,7 @@ export class ZcodeProtocolClient extends EventEmitter {
    */
   private prepareEntryLink(): string {
     const p = realpathSync(this.binPath);
-    if (!p.startsWith("/") || !p.endsWith(".cjs")) {
+    if (!isAbsolute(p) || !p.endsWith(".cjs")) {
       throw new ZcodeProtocolError(
         `invalid ZCODE_BIN (want an absolute path to the zcode .cjs entry script): ${this.binPath}`,
       );
@@ -126,6 +129,7 @@ export class ZcodeProtocolClient extends EventEmitter {
     if (!existsSync(p) || !statSync(p).isFile()) {
       throw new ZcodeProtocolError(`zcode CLI not found at ${this.binPath}. Set ZCODE_BIN to the zcode.cjs path.`);
     }
+    if (platform() === "win32") return dirname(p);
     const dir = join(homedir(), ".zcode-mcp");
     mkdirSync(dir, { recursive: true });
     try {
@@ -156,7 +160,8 @@ export class ZcodeProtocolClient extends EventEmitter {
     if (this.booted) return;
     const entryDir = this.prepareEntryLink();
     const env = this.buildChildEnv();
-    this.child = fork("zcode-entry.cjs", ["app-server"], {
+    const entry = platform() === "win32" ? realpathSync(this.binPath) : "zcode-entry.cjs";
+    this.child = fork(entry, ["app-server"], {
       cwd: entryDir,
       // "ipc" is required by fork(); the protocol itself runs over the stdin/stdout pipes.
       stdio: ["pipe", "pipe", "pipe", "ipc"],
@@ -414,6 +419,26 @@ export class ZcodeProtocolClient extends EventEmitter {
         }
       } catch { /* fall back to zcode's bundled provider discovery */ }
     }
+    if (!env.ZCODE_BUILTIN_PROVIDER_CONFIG_FILE && platform() === "win32") {
+      try {
+        const cpu = arch() === "arm64" ? "aarch64" : "x86_64";
+        const archDir = join(homedir(), ".zcode/v2/runtime/provider", `windows-${cpu}`);
+        const candidates: string[] = [];
+        for (const ver of readdirSync(archDir)) {
+          const verDir = join(archDir, ver);
+          if (!statSync(verDir).isDirectory()) continue;
+          for (const ep of readdirSync(verDir)) {
+            const f = join(verDir, ep, "zcode-builtin.json");
+            if (existsSync(f)) candidates.push(f);
+          }
+        }
+        candidates.sort((a, b) => statSync(b).mtimeMs - statSync(a).mtimeMs);
+        if (candidates[0]) {
+          env.ZCODE_BUILTIN_PROVIDER_CONFIG_FILE = candidates[0];
+          env.ZCODE_PERSONAL_PROVIDER_CONFIG_FILE = join(homedir(), ".zcode/v2/provider_config.json");
+        }
+      } catch { /* fall back to zcode's bundled provider discovery */ }
+    }
     // Node's bundled CA store misses the chain api.z.ai serves (Sectigo R46/USERTrust cross-sign);
     // export macOS system roots once and hand them to the child. Skip if user already set a bundle.
     if (!env.NODE_EXTRA_CA_CERTS && platform() === "darwin") {
@@ -431,7 +456,7 @@ export class ZcodeProtocolClient extends EventEmitter {
       } catch { /* best effort */ }
     }
     // zcode honors HTTPS_PROXY; node ignores the macOS system proxy, so forward it when set.
-    if (!env.HTTPS_PROXY && env.ZCODE_MCP_AUTO_PROXY !== "0") {
+    if (!env.HTTPS_PROXY && env.ZCODE_MCP_AUTO_PROXY !== "0" && platform() === "darwin") {
       try {
         const out = execFileSync("scutil", ["--proxy"], { encoding: "utf8" });
         const host = out.match(/HTTPSProxy : (\S+)/)?.[1];

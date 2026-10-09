@@ -30,6 +30,23 @@ zcode 自身没有 `mcp serve` 服务端模式,CLI 的 `-p` 无头模式又要�
    npm install && npm run build
    ```
 
+## Windows (this fork)
+
+Upstream is macOS-only. This fork (faxenoff/zcode_mcp) makes the same code run on Windows:
+
+- `ZCODE_BIN` defaults to `%LOCALAPPDATA%\Programs\ZCodeesources\glm\zcode.cjs`; any absolute `.cjs` path is accepted (upstream required a `/`-prefixed one).
+- The app-server is forked from the real `zcode.cjs` in its own directory — no symlinks, which need a privilege on Windows.
+- The provider config the desktop materialised is picked up from `~/.zcode/v2/runtime/provider/windows-<cpu>/<version>/<endpoint>/zcode-builtin.json` (newest wins), the way the macOS branch reads it through `plutil`.
+- `scutil` (macOS system proxy) is only consulted on macOS.
+
+Set `ZCODE_PROVIDER` to the account you actually logged in with (the default is `account:bigmodel-individual-coding-plan`; a Z.ai login is `account:zai-individual-coding-plan`):
+
+```
+claude mcp add zcode -s user -e ZCODE_PROVIDER=account:zai-individual-coding-plan -- node <repo>\dist\index.js
+```
+
+The ZCode desktop app does not have to be running; it only has to have logged in once. Verified on ZCode 0.16.9 / Node 24.
+
 ## 接入配置
 
 ### Codex
