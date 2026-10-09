@@ -23,6 +23,9 @@ import {
   symlinkSync,
   rmSync,
   realpathSync,
+  openSync,
+  readSync,
+  closeSync,
 } from "node:fs";
 import { arch, homedir, platform, userInfo } from "node:os";
 import { dirname, isAbsolute, join } from "node:path";
@@ -493,18 +496,47 @@ export class ZcodeProtocolClient extends EventEmitter {
     });
   }
 
-  /** The builtin revision marker the desktop uses; falls back to a static value. */
+  /**
+   * The builtin provider revision the app-server we spawned will accept in
+   * `provider/updateAccountConfig.basedOnZCodeBuiltinRevision`.
+   *
+   * It must be the CLI BUNDLE's revision, not the desktop app's. Until ZCode
+   * 3.14.5 the two were equal, so reading the desktop log worked; the
+   * 2026-09-30 bundle ships a provider config whose hash (`eb9fc603…`) differs
+   * from the desktop's (`bb313232…`), and a snapshot based on the wrong revision
+   * is answered "received" and then ignored: every provider stays fail-closed
+   * (entitled:false) and `session/create` lists no models at all.
+   *
+   * The app-server logs its own revision in `zcode_protocol.provider_registry.ready`
+   * (`~/.zcode/cli/log/zcode-<date>.jsonl`, `context.accountRevision`) ~70 ms
+   * after start; `start()` pushes 1.5 s after spawn, so the newest line is ours.
+   * Order: that log, then the desktop logs (older ZCode, same value), then a
+   * static value.
+   */
   private readBuiltinRevision(): string {
-    try {
-      const logDir = join(homedir(), ".zcode/v2/logs");
-      const files = readdirSync(logDir).filter((f) => f.endsWith(".log")).sort();
-      for (let i = files.length - 1; i >= 0; i--) {
-        const content = readFileSync(join(logDir, files[i]), "utf8");
-        const m = content.match(/zcode-builtin:\d+:[a-f0-9]{64}/);
-        if (m) return m[0];
-      }
-    } catch { /* best effort */ }
-    return "zcode-builtin:30:88e38574b72855470e74ea688babe38a5e8c14a42c908cb73098e115a0705a5d";
+    const re = /zcode-builtin:\d+:[a-f0-9]{64}/g;
+    const lastIn = (dir: string, pick: (name: string) => boolean): string | null => {
+      try {
+        const files = readdirSync(dir).filter(pick).sort();
+        for (let i = files.length - 1; i >= 0; i--) {
+          const path = join(dir, files[i]);
+          // the newest line is at the end; a day of logs can be large — read the tail only
+          const size = statSync(path).size;
+          const from = Math.max(0, size - 512 * 1024);
+          const buf = Buffer.alloc(size - from);
+          const fd = openSync(path, "r");
+          try { readSync(fd, buf, 0, buf.length, from); } finally { closeSync(fd); }
+          const all = buf.toString("utf8").match(re);
+          if (all && all.length) return all[all.length - 1];
+        }
+      } catch { /* best effort */ }
+      return null;
+    };
+    return (
+      lastIn(join(homedir(), ".zcode/cli/log"), (f) => f.startsWith("zcode-") && f.endsWith(".jsonl")) ??
+      lastIn(join(homedir(), ".zcode/v2/logs"), (f) => f.endsWith(".log")) ??
+      "zcode-builtin:30:eb9fc603af991c9a3a620b47edb16dcf6748ce6c850bcd71441c4a84cc0532cd"
+    );
   }
 
   /** Find + decrypt the coding-plan api key for a provider from the zcode credential store. */
