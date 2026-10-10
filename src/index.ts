@@ -19,6 +19,7 @@ import {
   type PermissionMode,
   type SessionMessage,
 } from "./protocol.js";
+import { ModelCache, pickModel } from "./models.js";
 
 const debug = process.env.ZCODE_MCP_DEBUG === "1";
 const log = (msg: string) => {
@@ -27,7 +28,7 @@ const log = (msg: string) => {
 
 let client: ZcodeProtocolClient | null = null;
 let clientReady: Promise<ZcodeProtocolClient> | null = null;
-const cachedModels = new Map<string, AvailableModel[]>(); // cwd -> models
+const cachedModels = new ModelCache(); // cwd -> models (never stores an empty list)
 
 async function getClient(): Promise<ZcodeProtocolClient> {
   if (clientReady) return clientReady;
@@ -94,28 +95,6 @@ function assertReasoning(level: string): string {
     throw new ZcodeProtocolError(`invalid reasoning_level: ${level.slice(0, 24)}`);
   }
   return level;
-}
-
-function pickModel(models: AvailableModel[], requested?: string): { model: AvailableModel; reasoning?: string } {
-  const want = (requested?.trim() || process.env.ZCODE_MODEL || "").toLowerCase();
-  let model: AvailableModel | undefined;
-  if (want) {
-    model = models.find(
-      (m) =>
-        m.modelId.toLowerCase() === want ||
-        `${m.providerId}/${m.modelId}`.toLowerCase() === want ||
-        (m.label ?? "").toLowerCase() === want,
-    );
-    if (!model) {
-      throw new ZcodeProtocolError(
-        `model "${requested}" not available. Available: ${models.map((m) => `${m.providerId}/${m.modelId}`).join(", ") || "(none)"}`,
-      );
-    }
-  } else {
-    model = models.find((m) => m.modelId === "GLM-5.3") ?? models[0];
-  }
-  const reasoning = process.env.ZCODE_REASONING?.trim() || model.reasoning?.defaultLevel || "max";
-  return { model, reasoning };
 }
 
 interface RunSummary {
@@ -190,9 +169,9 @@ server.registerTool(
         .number()
         .int()
         .min(10_000)
-        .max(3_600_000)
+        .max(7_200_000)
         .optional()
-        .describe("Turn timeout in ms (default 600000 = 10 min, max 3600000 = 1 h)."),
+        .describe("Turn timeout in ms (default 600000 = 10 min, max 7200000 = 2 h)."),
     },
   },
   async (args) => {
@@ -203,26 +182,32 @@ server.registerTool(
 
       let sessionId: string;
       let models: AvailableModel[];
+      let createdHere = false;
       if (args.session_id) {
         const resumeId = assertSessionId(args.session_id);
         log(`resuming session ${resumeId} in ${cwd}`);
         ({ sessionId } = await c.resumeSession(resumeId, cwd));
-        models = cachedModels.get(cwd) ?? [];
+        models = await c.readCurrentModels(sessionId).catch(() => cachedModels.get(cwd) ?? []);
       } else {
         log(`creating session in ${cwd}`);
         const created = await c.createSession(cwd, (args.mode as PermissionMode) ?? "yolo");
         sessionId = created.sessionId;
         models = created.models;
+        createdHere = true;
         cachedModels.set(cwd, models);
       }
 
-      const { model, reasoning } = pickModel(models, args.model);
-      if (!model) {
-        throw new ZcodeProtocolError(
-          "no models available — check that zcode is logged in (open the ZCode desktop app once, or set ZCODE_PROVIDER).",
-        );
+      let model: AvailableModel;
+      let level: string;
+      try {
+        const picked = pickModel(models, args.model, c.readiness);
+        model = picked.model;
+        level = assertReasoning(args.reasoning_level?.trim() || picked.reasoning || "max");
+      } catch (e) {
+        // Nothing was sent to this session yet — don't leave an empty row behind.
+        if (createdHere) await c.disposeSession(sessionId).catch(() => {});
+        throw e;
       }
-      const level = assertReasoning(args.reasoning_level?.trim() || reasoning || "max");
 
       const started = Date.now();
       const result = await c.runTurn(sessionId, prompt, model, level, args.timeout_ms ?? 600_000);
@@ -292,15 +277,32 @@ server.registerTool(
       const credDir = `${homedir()}/.zcode/v2/credentials.json`;
       const hasCred = existsSync(credDir);
       const preferred = process.env.ZCODE_PROVIDER ?? "account:bigmodel-individual-coding-plan";
-      const probe = await c.createSession(resolveCwd(undefined), "plan");
+      const ws = resolveCwd(undefined);
+      const probe = await c.createSession(ws, "plan");
       const models = probe.models.map((m) => m.modelId);
-      cachedModels.set(probe.sessionId, probe.models);
+      cachedModels.set(ws, probe.models);
+      await c.disposeSession(probe.sessionId).catch(() => {});
+      let status: string;
+      if (models.length) {
+        status = "ok";
+      } else if (c.readiness.state === "no-credentials") {
+        status =
+          "no models available — no credentials: log in once via the ZCode desktop app " +
+          "(they are stored in ~/.zcode/v2/credentials.json), then retry";
+      } else if (c.readiness.state === "timeout") {
+        status =
+          `no models available — the app-server was still loading after ${c.readiness.waitedMs}ms ` +
+          "(retry in a few seconds), or the provider refused the account — verify the login is entitled and, " +
+          "if it was rejected, re-login in the ZCode desktop app and restart this MCP server";
+      } else {
+        status = "no models available — retry in a few seconds; if it persists the provider refused the account";
+      }
       const lines = [
         `binary: ${c.binaryPath}`,
         `credentials: ${hasCred ? `found (${credDir})` : `MISSING — log in via the ZCode desktop app`}`,
         `preferred_provider: ${preferred}`,
         `models: ${models.join(", ") || "(none)"}`,
-        `status: ${models.length ? "ok" : "no models available"}`,
+        `status: ${status}`,
       ];
       return { content: [{ type: "text" as const, text: lines.join("\n") }] };
     } catch (e) {

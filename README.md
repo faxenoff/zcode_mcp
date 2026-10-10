@@ -21,7 +21,7 @@ zcode 自身没有 `mcp serve` 服务端模式,CLI 的 `-p` 无头模式又要�
 
 ## 前置条件
 
-1. **ZCode 桌面版**(macOS)已安装,且**登录过一次**——登录凭据存放在 `~/.zcode/v2/credentials.json`,zcode-mcp 复用它们,无需再次登录。
+1. **ZCode 桌面版**已安装,且**登录过一次**——登录凭据存放在 `~/.zcode/v2/credentials.json`,zcode-mcp 复用它们,无需再次登录。此后桌面版**无需再运行**:provider 配置由 zcode-mcp 自行引导(优先用 `~/.zcode/v2/runtime/provider/` 下已物化的配置;没有则从安装目录自带的 `resources/config/provider/zcode-builtin.json` 复制到 `~/.zcode-mcp/`),builtin revision 在本地按 `zcode-builtin:<revision>:sha256(<配置绝对路径>)` 确定性推导,不依赖桌面版日志。coding-plan api-key 没有可读的过期时间:若模型请求开始报鉴权错误,在桌面版重新登录一次(刷新 credentials.json)并重启 MCP server 即可。
 2. Node.js ≥ 18。
 3. 构建本工具:
    ```bash
@@ -34,9 +34,9 @@ zcode 自身没有 `mcp serve` 服务端模式,CLI 的 `-p` 无头模式又要�
 
 Upstream is macOS-only. This fork (faxenoff/zcode_mcp) makes the same code run on Windows:
 
-- `ZCODE_BIN` defaults to `%LOCALAPPDATA%\Programs\ZCodeesources\glm\zcode.cjs`; any absolute `.cjs` path is accepted (upstream required a `/`-prefixed one).
+- `ZCODE_BIN` defaults to `%LOCALAPPDATA%\Programs\ZCode\resources\glm\zcode.cjs`; any absolute `.cjs` path is accepted (upstream required a `/`-prefixed one).
 - The app-server is forked from the real `zcode.cjs` in its own directory — no symlinks, which need a privilege on Windows.
-- The provider config the desktop materialised is picked up from `~/.zcode/v2/runtime/provider/windows-<cpu>/<version>/<endpoint>/zcode-builtin.json` (newest wins), the way the macOS branch reads it through `plutil`.
+- The provider config the desktop materialised is picked up from `~/.zcode/v2/runtime/provider/windows-<cpu>/<version>/<endpoint>/zcode-builtin.json` (newest wins). When the desktop has never run, the config shipped with the install (`<ZCode>\resources\config\provider\zcode-builtin.json`) is copied to `~/.zcode-mcp\zcode-builtin.json` and used instead — the CLI itself never looks there on Windows.
 - `scutil` (macOS system proxy) is only consulted on macOS.
 
 Set `ZCODE_PROVIDER` to the account you actually logged in with (the default is `account:bigmodel-individual-coding-plan`; a Z.ai login is `account:zai-individual-coding-plan`):
@@ -45,7 +45,7 @@ Set `ZCODE_PROVIDER` to the account you actually logged in with (the default is 
 claude mcp add zcode -s user -e ZCODE_PROVIDER=account:zai-individual-coding-plan -- node <repo>\dist\index.js
 ```
 
-The ZCode desktop app does not have to be running; it only has to have logged in once. Verified on ZCode 0.16.9 / Node 24.
+The ZCode desktop app does not have to be running, and never has to be launched again after the one-time login that writes `~/.zcode/v2/credentials.json`. The builtin provider revision required by `provider/updateAccountConfig` is derived locally (`zcode-builtin:<revision>:sha256(<absolute config path>)`) — it does not read desktop logs. Verified on ZCode 3.14.5 (2026-09-30 bundle) / Node 24.
 
 ## 接入配置
 
@@ -100,6 +100,7 @@ zcode 桌面版并不直接跑 agent,而是 spawn `zcode app-server` 子进程,�
 
 - **传输**:stdio 上的行分隔 JSON(注意:不是 JSON-RPC,带 `jsonrpc` 键会被严格 zod 校验拒绝)。
 - **provider 物化**:app-server 自身不持有账号 provider。桌面版启动时通过 `provider/updateAccountConfig` 推送 provider 定义(不带密钥),并在每次模型请求时响应 `interaction/requestProviderRuntimeHeaders` 注入凭据。zcode-mcp 读取 `~/.zcode/v2/credentials.json` 中加密的 coding-plan api-key(AES-256-GCM,密钥由机器指纹派生)完成同样的事。
+- **启动就绪**:app-server 对 `provider/updateAccountConfig` 先应答、后应用;若推送带的 `basedOnZCodeBuiltinRevision` 与子进程解析到的 builtin 配置不一致,推送会被**静默丢弃**(所有 provider 保持 fail-closed、模型列表为空)。zcode-mcp 按确定性公式在本地推导该 revision,并在推送后轮询 `session/read`(其 `settings.model.available` 每次调用都按当前可用性重算)直到模型出现——凭据缺失时立即判定并明确报告,因此冷启动后的第一次 `zcode_run`/`zcode_check` 不会再撞上空模型列表。
 - **会话**:`session/create`(可带 mode/model)→ `session/subscribe` → `session/send`(带 `modelSelection`,含必填的 `reasoningLevel`)→ 收 `session/event` 通知直到 `turn.completed`/`turn.failed` → `session/messages` 取结构化结果(答复文本、工具调用、token 用量)。
 - **TLS/代理**:Node 内置 CA 库缺 api.z.ai 的 Sectigo 新证书链;首次启动会把 macOS 系统根证书导出到 `~/.zcode-mcp-system-roots.pem` 并以 `NODE_EXTRA_CA_CERTS` 传给子进程。若设置了系统代理,也会自动以 `HTTPS_PROXY` 透传(zcode 原生支持)。
 - **进程隔离**:zcode 入口脚本被软链到 `~/.zcode-mcp/zcode-entry.cjs`,子进程以固定相对路径 fork,不拼接任何动态命令。
@@ -116,6 +117,8 @@ zcode 桌面版并不直接跑 agent,而是 spawn `zcode app-server` 子进程,�
 npm run build        # 编译到 dist/
 node scripts/probe.mjs "..."       # 直接驱动 app-server 协议(逆向用)
 node scripts/probe-fork.mjs        # fork 模式事件流对照实验
+node scripts/race_probe.mjs [N]    # 冷启动竞态探针:全新子进程首次查询模型列表是否为空
+node scripts/fresh-home-probe.mjs  # 桌面独立性实验:全新 HOME 下 app-server 能否找到 builtin 配置
 node scripts/e2e.mjs               # 端到端:起 MCP server,跑 zcode_check/zcode_run/追问/会话列表
 ```
 
@@ -123,7 +126,7 @@ node scripts/e2e.mjs               # 端到端:起 MCP server,跑 zcode_check/zc
 
 - ZCode Protocol 是内部接口,随 zcode 版本(当前验证 0.16.9)可能变动;协议层全部隔离在 `src/protocol.ts`,变动时只需改这一个文件。
 - 权限确认交互被自动拒绝,因此 `build`/`edit` 模式下需要确认的操作会失败——无头委派场景建议 `yolo`。
-- 每个工作区首次 `session/create` 后模型列表会缓存;切换 zcode 登录账号需重启 MCP server。
+- 模型列表按工作区缓存,但**空列表永不缓存**(空列表是启动竞态的产物,不是账号事实);`start()` 完成前会等 app-server 真正暴露模型(最多 10 s)。切换 zcode 登录账号需重启 MCP server;若后端开始拒绝凭据(模型请求报鉴权错误),在桌面版重新登录一次并重启本 server——api-key 本身无可读的过期时间,无法提前检测。
 
 ## License
 

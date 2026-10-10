@@ -20,15 +20,17 @@ import {
   writeFileSync,
   statSync,
   mkdirSync,
+  mkdtempSync,
   symlinkSync,
+  copyFileSync,
   rmSync,
   realpathSync,
   openSync,
   readSync,
   closeSync,
 } from "node:fs";
-import { arch, homedir, platform, userInfo } from "node:os";
-import { dirname, isAbsolute, join } from "node:path";
+import { arch, homedir, platform, tmpdir, userInfo } from "node:os";
+import { dirname, isAbsolute, join, resolve } from "node:path";
 import { createHash, createDecipheriv } from "node:crypto";
 import { EventEmitter } from "node:events";
 
@@ -97,6 +99,12 @@ export class ZcodeProtocolError extends Error {
   }
 }
 
+/** Why the model list looks the way it does after boot — drives user-facing errors. */
+export type ModelsReadiness =
+  | { state: "ready" }
+  | { state: "no-credentials"; preferred: string }
+  | { state: "timeout"; waitedMs: number };
+
 export class ZcodeProtocolClient extends EventEmitter {
   private child: ChildProcess | null = null;
   private nextId = 1;
@@ -105,6 +113,9 @@ export class ZcodeProtocolClient extends EventEmitter {
   private booted = false;
   private buffer = "";
   private startWaiters: (() => void)[] = [];
+  private activeBuiltinConfigPath: string | null = null;
+  private pushedBuiltinRevision: string | null = null;
+  private modelsReadiness: ModelsReadiness = { state: "timeout", waitedMs: 0 };
 
   constructor(
     private readonly binPath: string = process.env.ZCODE_BIN ?? DEFAULT_ZCODE_BIN,
@@ -115,6 +126,11 @@ export class ZcodeProtocolClient extends EventEmitter {
 
   get binaryPath(): string {
     return this.binPath;
+  }
+
+  /** Outcome of the post-boot model-availability wait (set once by start()). */
+  get readiness(): ModelsReadiness {
+    return this.modelsReadiness;
   }
 
   /**
@@ -184,11 +200,21 @@ export class ZcodeProtocolClient extends EventEmitter {
       this.child = null;
       for (const [, p] of this.pending) p.reject(new ZcodeProtocolError(`app-server exited (${signal ?? code})`));
       this.pending.clear();
+      // A child that dies before signaling startup must not stall start() for 30s;
+      // resolving lets the follow-up request fail fast with "app-server exited".
+      const waiters = this.startWaiters;
+      this.startWaiters = [];
+      for (const fn of waiters) fn();
       this.emit("exit");
     });
 
     await this.waitForStartup();
     await this.pushAccountProviders();
+    // The account-config push is acknowledged before the app-server necessarily
+    // applied it, and a snapshot raced ahead of the provider registry shows an
+    // empty model list. Wait until models are actually exposed (or it is clear
+    // none can be) before declaring the client usable.
+    await this.waitForModels();
     this.booted = true;
   }
 
@@ -212,18 +238,17 @@ export class ZcodeProtocolClient extends EventEmitter {
     const sessionId = snap?.session?.sessionId;
     if (!sessionId) throw new ZcodeProtocolError("session/create returned no sessionId");
     await this.request("session/subscribe", { sessionId, deliveryKind: "desktop-continuous" }).catch(() => {});
-    // Snapshot entries are {ref: {providerId, modelId}, label, ...} — flatten to ModelRef.
-    const models = ((snap?.settings?.model?.available ?? []) as any[])
-      .map((m) => ({
-        providerId: m.ref?.providerId ?? m.providerId,
-        modelId: m.ref?.modelId ?? m.modelId,
-        label: m.label,
-        contextWindow: m.contextWindow,
-        maxOutputTokens: m.maxOutputTokens,
-        reasoning: m.reasoning,
-      }))
-      .filter((m) => typeof m.providerId === "string" && typeof m.modelId === "string") as AvailableModel[];
-    return { sessionId, models };
+    return { sessionId, models: extractModels(snap) };
+  }
+
+  /**
+   * Current model availability for a session. `session/read` recomputes the
+   * availability per call (modelAvailability: "current" in the bundle), so this
+   * reflects provider-registry changes that happened after the session was made.
+   */
+  async readCurrentModels(sessionId: string): Promise<AvailableModel[]> {
+    const res = await this.request("session/read", { sessionId });
+    return extractModels(res?.value ?? res);
   }
 
   /** Re-attach to an existing session from a previous server run. */
@@ -290,6 +315,10 @@ export class ZcodeProtocolClient extends EventEmitter {
   private request(method: string, params: unknown, timeoutMs = 30_000): Promise<any> {
     const id = this.nextId++;
     return new Promise((resolve, reject) => {
+      if (!this.child?.stdin) {
+        reject(new ZcodeProtocolError(`app-server not running (${method})`, "no_child"));
+        return;
+      }
       const timer = setTimeout(() => {
         this.pending.delete(id);
         reject(new ZcodeProtocolError(`timeout waiting for ${method}`, "request_timeout"));
@@ -321,12 +350,110 @@ export class ZcodeProtocolClient extends EventEmitter {
   }
 
   private waitForStartup(): Promise<void> {
-    return new Promise((resolve) => {
-      const check = () => resolve();
-      this.startWaiters.push(check);
+    return new Promise((resolve, reject) => {
+      let settled = false;
+      const done = () => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        resolve();
+      };
       // The first notification (startup/storageState) means the process is alive.
-      setTimeout(check, 1500);
+      const timer = setTimeout(() => {
+        if (settled) return;
+        settled = true;
+        reject(
+          new ZcodeProtocolError(
+            "app-server sent no startup signal within 30s — check that node \"" +
+              this.binPath +
+              "\" app-server starts (ZCODE_BIN may point to a broken or mismatched install)",
+            "startup_timeout",
+          ),
+        );
+      }, 30_000);
+      this.startWaiters.push(done);
     });
+  }
+
+  /**
+   * Block until the app-server exposes at least one model, or until it is clear
+   * none can appear. Runs after the provider push, which the app-server
+   * acknowledges before its provider registry has necessarily applied it.
+   */
+  private async waitForModels(): Promise<void> {
+    const preferred = process.env.ZCODE_PROVIDER ?? "account:bigmodel-individual-coding-plan";
+    if (!this.hasAnyAccountCredential()) {
+      this.modelsReadiness = { state: "no-credentials", preferred };
+      return;
+    }
+    const first = await this.pollModels(10_000);
+    if (first.state === "ready") {
+      this.modelsReadiness = first;
+      return;
+    }
+    // Self-heal one wrong-revision push: if the pushed basedOnZCodeBuiltinRevision
+    // disagreed with the child's builtin config, the push was silently dropped.
+    // The child has certainly flushed its own revision to the CLI log by now.
+    const logged = this.revisionFromLogs();
+    if (logged && logged !== this.pushedBuiltinRevision) {
+      this.logger(`models empty after boot; re-pushing providers with the child's logged revision ${logged}`);
+      await this.pushAccountProviders(logged);
+      this.modelsReadiness = await this.pollModels(5_000);
+      return;
+    }
+    this.modelsReadiness = first;
+  }
+
+  /** Poll session/read on one throwaway session until models appear. */
+  private async pollModels(timeoutMs: number): Promise<ModelsReadiness> {
+    const started = Date.now();
+    const deadline = started + timeoutMs;
+    let delay = 100;
+    let sessionId: string | null = null;
+    let ws: string | null = null;
+    try {
+      while (Date.now() < deadline) {
+        try {
+          if (!sessionId) {
+            ws ??= mkdtempSync(join(tmpdir(), "zcode-mcp-boot-"));
+            sessionId = (await this.createSession(ws, "plan")).sessionId;
+          }
+          if ((await this.readCurrentModels(sessionId)).length > 0) return { state: "ready" };
+        } catch {
+          sessionId = null; // registry still settling; retry with a fresh session
+        }
+        await this.sleep(delay);
+        delay = Math.min(delay * 2, 500);
+      }
+      return { state: "timeout", waitedMs: Date.now() - started };
+    } finally {
+      if (sessionId) await this.disposeSession(sessionId).catch(() => {});
+      if (ws) {
+        try { rmSync(ws, { recursive: true, force: true }); } catch { /* Windows handle lag */ }
+      }
+    }
+  }
+
+  private sleep(ms: number): Promise<void> {
+    return new Promise((r) => setTimeout(r, ms));
+  }
+
+  /** Any coding-plan api key in the zcode credential store (any provider id)? */
+  private hasAnyAccountCredential(): boolean {
+    try {
+      const path = join(homedir(), ".zcode/v2/credentials.json");
+      if (!existsSync(path)) return false;
+      const cred = JSON.parse(readFileSync(path, "utf8")) as Record<string, string>;
+      return Object.entries(cred).some(
+        ([k, v]) =>
+          k.startsWith("account-provider:coding-plan:") &&
+          k.endsWith(":api-key") &&
+          typeof v === "string" &&
+          v.trim().length > 0,
+      );
+    } catch {
+      return false;
+    }
   }
 
   private handleMessage(msg: any): void {
@@ -442,6 +569,26 @@ export class ZcodeProtocolClient extends EventEmitter {
         }
       } catch { /* fall back to zcode's bundled provider discovery */ }
     }
+    if (!env.ZCODE_BUILTIN_PROVIDER_CONFIG_FILE) {
+      // No desktop-materialized runtime config (the desktop app never ran).
+      // The installer ships the bundle's builtin config at
+      // <installRoot>/config/provider/zcode-builtin.json; the CLI itself never
+      // looks there, so hand it over via the env pair it requires. Copy it to
+      // ~/.zcode-mcp so the CLI's refresh sidecar files never land in the
+      // install directory.
+      try {
+        const shipped = join(dirname(dirname(realpathSync(this.binPath))), "config", "provider", "zcode-builtin.json");
+        if (existsSync(shipped)) {
+          const dir = join(homedir(), ".zcode-mcp");
+          mkdirSync(dir, { recursive: true });
+          const copy = join(dir, "zcode-builtin.json");
+          if (!existsSync(copy)) copyFileSync(shipped, copy);
+          env.ZCODE_BUILTIN_PROVIDER_CONFIG_FILE = copy;
+          env.ZCODE_PERSONAL_PROVIDER_CONFIG_FILE = join(homedir(), ".zcode/v2/provider_config.json");
+        }
+      } catch { /* fall back to zcode's bundled provider discovery */ }
+    }
+    this.activeBuiltinConfigPath = env.ZCODE_BUILTIN_PROVIDER_CONFIG_FILE ?? null;
     // Node's bundled CA store misses the chain api.z.ai serves (Sectigo R46/USERTrust cross-sign);
     // export macOS system roots once and hand them to the child. Skip if user already set a bundle.
     if (!env.NODE_EXTRA_CA_CERTS && platform() === "darwin") {
@@ -474,7 +621,7 @@ export class ZcodeProtocolClient extends EventEmitter {
   }
 
   /** Push account provider definitions, mirroring the ZCode desktop app. */
-  private async pushAccountProviders(): Promise<void> {
+  private async pushAccountProviders(basedOnRevision?: string): Promise<void> {
     const providers: Record<string, { access: { type: string; entitled: boolean } }> = {};
     const states: Record<string, Record<string, unknown>> = {};
     const preferred = process.env.ZCODE_PROVIDER ?? "account:bigmodel-individual-coding-plan";
@@ -488,9 +635,11 @@ export class ZcodeProtocolClient extends EventEmitter {
       states[p] = { availability: entitled ? "available" : "unavailable", entitled, current };
       if (current) currentSet = true;
     }
+    const basedOn = basedOnRevision ?? this.readBuiltinRevision();
+    this.pushedBuiltinRevision = basedOn;
     await this.request("provider/updateAccountConfig", {
       revision: `account:zcode-mcp:${Date.now()}`,
-      basedOnZCodeBuiltinRevision: this.readBuiltinRevision(),
+      basedOnZCodeBuiltinRevision: basedOn,
       providers,
       states,
     });
@@ -500,20 +649,42 @@ export class ZcodeProtocolClient extends EventEmitter {
    * The builtin provider revision the app-server we spawned will accept in
    * `provider/updateAccountConfig.basedOnZCodeBuiltinRevision`.
    *
-   * It must be the CLI BUNDLE's revision, not the desktop app's. Until ZCode
-   * 3.14.5 the two were equal, so reading the desktop log worked; the
-   * 2026-09-30 bundle ships a provider config whose hash (`eb9fc603…`) differs
-   * from the desktop's (`bb313232…`), and a snapshot based on the wrong revision
-   * is answered "received" and then ignored: every provider stays fail-closed
-   * (entitled:false) and `session/create` lists no models at all.
-   *
-   * The app-server logs its own revision in `zcode_protocol.provider_registry.ready`
-   * (`~/.zcode/cli/log/zcode-<date>.jsonl`, `context.accountRevision`) ~70 ms
-   * after start; `start()` pushes 1.5 s after spawn, so the newest line is ours.
-   * Order: that log, then the desktop logs (older ZCode, same value), then a
-   * static value.
+   * It must match the BUILTIN CONFIG FILE the child resolves as active. The
+   * app-server derives it as `zcode-builtin:<release.revision>:<sha256(resolve(
+   * activeFilePath))>` (zcode.cjs, builtin config source constructor), and we
+   * control activeFilePath through ZCODE_BUILTIN_PROVIDER_CONFIG_FILE — so the
+   * same arithmetic on our chosen file is exact, with no race against the
+   * child's first log flush. Log tailing and a static value only back this up.
    */
   private readBuiltinRevision(): string {
+    return (
+      this.deterministicBuiltinRevision() ??
+      this.revisionFromLogs() ??
+      "zcode-builtin:30:eb9fc603af991c9a3a620b47edb16dcf6748ce6c850bcd71441c4a84cc0532cd"
+    );
+  }
+
+  private deterministicBuiltinRevision(): string | null {
+    const p = this.activeBuiltinConfigPath;
+    if (!p) return null;
+    try {
+      const cfg = JSON.parse(readFileSync(p, "utf8")) as { revision?: unknown };
+      if (typeof cfg.revision === "number" && Number.isFinite(cfg.revision)) {
+        return `zcode-builtin:${cfg.revision}:${createHash("sha256").update(resolve(p)).digest("hex")}`;
+      }
+    } catch { /* fall through */ }
+    return null;
+  }
+
+  /**
+   * The newest `zcode-builtin:<rev>:<hash>` line from the CLI's own logs
+   * (`zcode_protocol.provider_registry.ready`, context.accountRevision). The
+   * child writes it ~70 ms after start, so by the time a models wait has timed
+   * out it is certainly flushed — but at push time it can race the flush and
+   * hand back another process's revision (e.g. the desktop's), which the child
+   * then silently drops.
+   */
+  private revisionFromLogs(): string | null {
     const re = /zcode-builtin:\d+:[a-f0-9]{64}/g;
     const lastIn = (dir: string, pick: (name: string) => boolean): string | null => {
       try {
@@ -534,8 +705,7 @@ export class ZcodeProtocolClient extends EventEmitter {
     };
     return (
       lastIn(join(homedir(), ".zcode/cli/log"), (f) => f.startsWith("zcode-") && f.endsWith(".jsonl")) ??
-      lastIn(join(homedir(), ".zcode/v2/logs"), (f) => f.endsWith(".log")) ??
-      "zcode-builtin:30:eb9fc603af991c9a3a620b47edb16dcf6748ce6c850bcd71441c4a84cc0532cd"
+      lastIn(join(homedir(), ".zcode/v2/logs"), (f) => f.endsWith(".log"))
     );
   }
 
@@ -571,4 +741,18 @@ export class ZcodeProtocolClient extends EventEmitter {
     d.setAuthTag(tag);
     return Buffer.concat([d.update(ct), d.final()]).toString("utf8");
   }
+}
+
+/** Snapshot settings.model.available entries are {ref: {providerId, modelId}, label, ...}. */
+function extractModels(snap: any): AvailableModel[] {
+  return (((snap?.settings?.model?.available ?? []) as any[])
+    .map((m) => ({
+      providerId: m.ref?.providerId ?? m.providerId,
+      modelId: m.ref?.modelId ?? m.modelId,
+      label: m.label,
+      contextWindow: m.contextWindow,
+      maxOutputTokens: m.maxOutputTokens,
+      reasoning: m.reasoning,
+    }))
+    .filter((m) => typeof m.providerId === "string" && typeof m.modelId === "string")) as AvailableModel[];
 }
