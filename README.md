@@ -15,7 +15,7 @@ zcode 自身没有 `mcp serve` 服务端模式,CLI 的 `-p` 无头模式又要�
 
 | 工具 | 说明 |
 |---|---|
-| `zcode_run` | 委派一个开发任务给 zcode。参数:`prompt`(必填)、`cwd`(项目目录)、`mode`(plan/build/edit/yolo,默认 yolo)、`model`(默认 GLM-5.3)、`reasoning_level`(low/high/max)、`session_id`(续接上一轮)、`timeout_ms`(默认 10 分钟,上限 1 小时)。返回 zcode 的最终答复 + `session_id` + 工具使用/token/耗时统计 |
+| `zcode_run` | 委派一个开发任务给 zcode。参数:`prompt`(必填)、`cwd`(项目目录)、`mode`(plan/build/edit/yolo,默认 yolo)、`model`(默认 GLM-5.3)、`reasoning_level`(low/high/max)、`session_id`(续接上一轮)、`timeout_ms`(默认 10 分钟,上限 2 小时;超时后见 "Process lifecycle")。返回 zcode 的最终答复 + `session_id` + 工具使用/token/耗时统计 |
 | `zcode_check` | 检查后端可用性:二进制路径、凭据、可用模型列表 |
 | `zcode_sessions` | 列出某工作区的最近会话(可作为 `session_id` 续接) |
 
@@ -93,6 +93,54 @@ claude mcp add zcode -- node <repo>/dist/index.js
 | `ZCODE_MCP_AUTO_PROXY` | `1` | 自动检测 macOS 系统代理并透传给 zcode 子进程(`0` 关闭) |
 | `ZCODE_MCP_DEBUG` | – | `1` 时向 stderr 输出调试日志 |
 | `ZCODE_CREDENTIAL_SECRET` | 机器指纹派生 | zcode 凭据加密密钥(与 zcode 客户端一致,一般无需设置) |
+| `ZCODE_TURN_GRACE_MS` | `600000` (10 min) | after a `zcode_run` times out, the turn may keep running this long, then it is stopped and its processes are killed (see "Process lifecycle") |
+| `ZCODE_SESSION_IDLE_MS` | `1800000` (30 min) | an open session with no turn for this long is closed and its processes are killed (the session stays on disk) |
+| `ZCODE_REAP_INTERVAL_MS` | `60000` | how often the idle / orphan sweep runs |
+| `ZCODE_REAP` | `1` | `0` = never kill processes (sessions are still closed after each turn) |
+
+## Process lifecycle
+
+The app-server hosts every session inside its own process. What it spawns are direct children:
+bash shells for the agent's commands (their command line carries
+`~/.zcode/cli/exec/bash-startup/sess_<id>/...`), `__zcode-plugin-host` node processes and the stdio
+MCP servers from `~/.zcode/cli/config.json` (e.g. `code-daemon-mcp.exe`). Every opened session —
+including the throwaway ones used at boot and by `zcode_check` — gets its own plugin host and MCP
+servers, and the app-server never stops them: not when a turn ends, not on `session/close`, and its
+own idle unloading is disabled for sessions with a stream subscriber (which zcode-mcp always is).
+Before this, a day of delegation left ~100 node processes (3.4 GB) behind.
+
+What zcode-mcp does now:
+
+- **After every `zcode_run`** (success, failure, error) the session is closed on the app-server
+  (`session/close`) and its processes are killed. The session stays on disk: the next `zcode_run`
+  with its `session_id` resumes it with full history (`session/resume` re-spawns what it needs).
+- **Timed-out turns are not killed at once.** When `timeout_ms` expires the caller gets
+  `turn timed out` together with the `session_id`, but the turn keeps running in the background —
+  useful when zcode is about to commit. When it finishes on its own, the session is closed and
+  reaped. If it is still running after `ZCODE_TURN_GRACE_MS` (default 10 min), it is stopped
+  (`session/stop`) and reaped. A new `zcode_run` on that `session_id` stops the background turn
+  first and then sends the new prompt.
+- **Idle reaper**: every `ZCODE_REAP_INTERVAL_MS` open sessions without a turn for
+  `ZCODE_SESSION_IDLE_MS` (default 30 min) are closed, and leftovers are swept.
+- **On exit** (stdin closed by the MCP host, SIGTERM/SIGINT/SIGHUP, `process.exit`) the whole
+  app-server tree is killed: `taskkill /T /F` on Windows; on macOS/Linux the app-server is forked
+  as a process-group leader and the group plus every descendant gets SIGKILL.
+- **Crash leftovers**: on boot, app-servers whose parent process is gone (a zcode-mcp that was
+  SIGKILLed) are killed with their trees. App-servers with a live parent (the ZCode desktop app,
+  other zcode-mcp instances) are never touched.
+
+How a process is matched to a session: the processes are listed (`Get-CimInstance Win32_Process`
+on Windows, `ps -A -o pid=,ppid=,rss=,etime=,command=` elsewhere) and only children of *this*
+server's app-server are considered. A shell belongs to the session named in its `bash-startup`
+path. Plugin hosts and MCP servers carry no session id (it is only in their environment, which
+cannot be read portably), so they are matched by creation time: their candidate owners are all
+sessions that were open on the app-server when they started (±3 s). A child is killed only when
+**all** candidate owners are closed, so with several concurrent sessions a shared one survives
+until the last of them closes. Children no open session explains are killed only when no session
+is open at all (and they are older than 10 s). The app-server's own `conhost.exe` is never touched.
+
+`zcode_check` sweeps once and reports the tree, e.g.
+`processes: app-server pid 30100 + 2 children (code-daemon-mcp.exe×1, conhost.exe×1), 223 MB total; open sessions: 0, running turns: 0 (in grace: 0); reaped now: 4`.
 
 ## 工作原理(逆向笔记)
 
@@ -120,6 +168,7 @@ node scripts/probe-fork.mjs        # fork 模式事件流对照实验
 node scripts/race_probe.mjs [N]    # 冷启动竞态探针:全新子进程首次查询模型列表是否为空
 node scripts/fresh-home-probe.mjs  # 桌面独立性实验:全新 HOME 下 app-server 能否找到 builtin 配置
 node scripts/e2e.mjs               # 端到端:起 MCP server,跑 zcode_check/zcode_run/追问/会话列表
+npm test                           # unit tests + live tests (boot a private app-server; ZCODE_SKIP_LIVE=1 skips the turn-spending one)
 ```
 
 ### 已知限制

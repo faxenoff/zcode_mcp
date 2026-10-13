@@ -36,11 +36,19 @@ async function getClient(): Promise<ZcodeProtocolClient> {
     const c = new ZcodeProtocolClient(undefined, log);
     c.on("exit", () => {
       // Next call will boot a fresh app-server.
-      client = null;
+      if (client === c) client = null;
       clientReady = null;
     });
-    await c.start();
+    // Visible to the shutdown handler while still booting.
     client = c;
+    try {
+      await c.start();
+    } catch (e) {
+      // A half-booted app-server (and whatever it spawned) must not outlive the failed attempt.
+      c.stopSync();
+      if (client === c) client = null;
+      throw e;
+    }
     return c;
   })();
   try {
@@ -175,6 +183,8 @@ server.registerTool(
     },
   },
   async (args) => {
+    // Set once a session is open on the app-server; released (closed + reaped) on every exit path.
+    let opened: { c: ZcodeProtocolClient; sessionId: string } | null = null;
     try {
       const cwd = resolveCwd(args.cwd);
       const prompt = sanitizeText(args.prompt);
@@ -187,11 +197,13 @@ server.registerTool(
         const resumeId = assertSessionId(args.session_id);
         log(`resuming session ${resumeId} in ${cwd}`);
         ({ sessionId } = await c.resumeSession(resumeId, cwd));
+        opened = { c, sessionId };
         models = await c.readCurrentModels(sessionId).catch(() => cachedModels.get(cwd) ?? []);
       } else {
         log(`creating session in ${cwd}`);
         const created = await c.createSession(cwd, (args.mode as PermissionMode) ?? "yolo");
         sessionId = created.sessionId;
+        opened = { c, sessionId };
         models = created.models;
         createdHere = true;
         cachedModels.set(cwd, models);
@@ -205,7 +217,10 @@ server.registerTool(
         level = assertReasoning(args.reasoning_level?.trim() || picked.reasoning || "max");
       } catch (e) {
         // Nothing was sent to this session yet — don't leave an empty row behind.
-        if (createdHere) await c.disposeSession(sessionId).catch(() => {});
+        if (createdHere) {
+          opened = null;
+          await c.disposeSession(sessionId).catch(() => {});
+        }
         throw e;
       }
 
@@ -257,8 +272,18 @@ server.registerTool(
         ],
       };
     } catch (e) {
-      const msg = e instanceof Error ? e.message : String(e);
+      let msg = e instanceof Error ? e.message : String(e);
+      if (e instanceof ZcodeProtocolError && e.code === "turn_timeout" && opened) {
+        const graceMin = Math.round(opened.c.lifecycle.turnGraceMs / 60_000);
+        msg +=
+          `\nsession_id: ${opened.sessionId}` +
+          `\nThe turn keeps running in the background for up to ${graceMin} min (ZCODE_TURN_GRACE_MS); ` +
+          "then it is stopped and its processes are killed. A new zcode_run with this session_id stops it first.";
+      }
       return { isError: true, content: [{ type: "text" as const, text: `zcode_run error: ${msg}` }] };
+    } finally {
+      // Close the session runtime and reap its processes (a timed-out turn does it when it ends).
+      if (opened) void opened.c.releaseSession(opened.sessionId).catch(() => {});
     }
   },
 );
@@ -297,12 +322,29 @@ server.registerTool(
       } else {
         status = "no models available — retry in a few seconds; if it persists the provider refused the account";
       }
+      let procLine: string;
+      try {
+        const reaped = await c.sweep();
+        const ps = await c.processStats();
+        const mb = Math.round(ps.memBytes / (1 << 20));
+        const kinds = new Map<string, number>();
+        for (const p of ps.children) kinds.set(p.name, (kinds.get(p.name) ?? 0) + 1);
+        const byName = [...kinds.entries()].map(([n, k]) => `${n}×${k}`).join(", ");
+        procLine =
+          `processes: app-server pid ${ps.appServerPid ?? "?"} + ${ps.children.length} children` +
+          `${byName ? ` (${byName})` : ""}, ${mb} MB total; open sessions: ${ps.residentSessions.length}, ` +
+          `running turns: ${ps.runningTurns.length} (in grace: ${ps.graceTurns.length}); ` +
+          `reaped now: ${reaped}${c.lifecycle.reapEnabled ? "" : " (ZCODE_REAP=0)"}`;
+      } catch (e) {
+        procLine = `processes: unavailable (${e instanceof Error ? e.message : String(e)})`;
+      }
       const lines = [
         `binary: ${c.binaryPath}`,
         `credentials: ${hasCred ? `found (${credDir})` : `MISSING — log in via the ZCode desktop app`}`,
         `preferred_provider: ${preferred}`,
         `models: ${models.join(", ") || "(none)"}`,
         `status: ${status}`,
+        procLine,
       ];
       return { content: [{ type: "text" as const, text: lines.join("\n") }] };
     } catch (e) {
@@ -348,18 +390,29 @@ server.registerTool(
   },
 );
 
+/** Take the whole app-server tree down with us, however we exit. */
+function installShutdown(): void {
+  let done = false;
+  const shutdown = (why: string, exit: boolean) => {
+    if (!done) {
+      done = true;
+      log(`shutting down (${why})`);
+      client?.stopSync();
+    }
+    if (exit) process.exit(0);
+  };
+  for (const sig of ["SIGTERM", "SIGINT", "SIGHUP"] as const) process.on(sig, () => shutdown(sig, true));
+  // The MCP client closing our stdin is how most hosts stop a stdio server (always on Windows).
+  process.stdin.on("end", () => shutdown("stdin closed", true));
+  process.stdin.on("close", () => shutdown("stdin closed", true));
+  process.on("exit", () => shutdown("exit", false));
+}
+
 async function main() {
   const transport = new StdioServerTransport();
   await server.connect(transport);
+  installShutdown();
   log("zcode-mcp ready (stdio)");
-  process.on("SIGTERM", async () => {
-    await client?.stop();
-    process.exit(0);
-  });
-  process.on("SIGINT", async () => {
-    await client?.stop();
-    process.exit(0);
-  });
 }
 
 main().catch((e) => {

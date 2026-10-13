@@ -33,6 +33,17 @@ import { arch, homedir, platform, tmpdir, userInfo } from "node:os";
 import { dirname, isAbsolute, join, resolve } from "node:path";
 import { createHash, createDecipheriv } from "node:crypto";
 import { EventEmitter } from "node:events";
+import {
+  SessionLedger,
+  descendants,
+  findOrphanAppServers,
+  killTree,
+  killTreeSync,
+  listProcesses,
+  planReap,
+  sumMemory,
+  type ProcInfo,
+} from "./processes.js";
 
 export const DEFAULT_ZCODE_BIN =
   platform() === "win32"
@@ -88,6 +99,56 @@ export interface SessionMessage {
   parts?: MessagePart[];
 }
 
+/** Process-lifecycle knobs (env-driven, see README "Process lifecycle"). */
+export interface LifecycleConfig {
+  /** After a turn times out on the client side it may run on for this long, then it is stopped and reaped. */
+  turnGraceMs: number;
+  /** Open sessions without a turn for this long are closed and their processes reaped. */
+  sessionIdleMs: number;
+  /** How often the idle/orphan sweep runs. */
+  reapIntervalMs: number;
+  /** false = never kill processes (sessions are still closed after each turn). */
+  reapEnabled: boolean;
+}
+
+function envMs(name: string, dflt: number): number {
+  const raw = process.env[name];
+  if (raw === undefined || raw.trim() === "") return dflt;
+  const v = Number(raw);
+  return Number.isFinite(v) && v >= 0 ? v : dflt;
+}
+
+export function lifecycleFromEnv(): LifecycleConfig {
+  return {
+    turnGraceMs: envMs("ZCODE_TURN_GRACE_MS", 600_000),
+    sessionIdleMs: envMs("ZCODE_SESSION_IDLE_MS", 1_800_000),
+    reapIntervalMs: Math.max(1_000, envMs("ZCODE_REAP_INTERVAL_MS", 60_000)),
+    reapEnabled: process.env.ZCODE_REAP !== "0",
+  };
+}
+
+interface ActiveTurn {
+  startedAt: number;
+  /** Resolves the runTurn() caller; cleared once the caller gave up (timeout). */
+  resolveCaller: ((r: TurnResult) => void) | null;
+  timedOutAt: number | null;
+  graceTimer: NodeJS.Timeout | null;
+  /** Close the session (and reap) as soon as the turn ends. */
+  releaseRequested: boolean;
+  endWaiters: (() => void)[];
+}
+
+export interface ProcessStats {
+  appServerPid: number | null;
+  /** Live descendants of the app-server (not counting it). */
+  children: ProcInfo[];
+  /** App-server + descendants, bytes. */
+  memBytes: number;
+  residentSessions: string[];
+  runningTurns: string[];
+  graceTurns: string[];
+}
+
 export class ZcodeProtocolError extends Error {
   constructor(
     message: string,
@@ -109,7 +170,13 @@ export class ZcodeProtocolClient extends EventEmitter {
   private child: ChildProcess | null = null;
   private nextId = 1;
   private pending = new Map<number, { resolve: (v: any) => void; reject: (e: Error) => void; method: string }>();
-  private turnWaiters = new Map<string, (r: TurnResult) => void>();
+  private activeTurns = new Map<string, ActiveTurn>();
+  /** When each session was open on the app-server (drives process attribution). */
+  readonly ledger = new SessionLedger();
+  readonly lifecycle: LifecycleConfig;
+  private reaperTimer: NodeJS.Timeout | null = null;
+  private sweepTimer: NodeJS.Timeout | null = null;
+  private sweeping: Promise<number> | null = null;
   private booted = false;
   private buffer = "";
   private startWaiters: (() => void)[] = [];
@@ -120,8 +187,15 @@ export class ZcodeProtocolClient extends EventEmitter {
   constructor(
     private readonly binPath: string = process.env.ZCODE_BIN ?? DEFAULT_ZCODE_BIN,
     private readonly logger: (msg: string) => void = () => {},
+    lifecycle?: Partial<LifecycleConfig>,
   ) {
     super();
+    this.lifecycle = { ...lifecycleFromEnv(), ...lifecycle };
+  }
+
+  /** pid of the app-server child (null when not running). */
+  get appServerPid(): number | null {
+    return this.child?.pid ?? null;
   }
 
   get binaryPath(): string {
@@ -185,6 +259,8 @@ export class ZcodeProtocolClient extends EventEmitter {
       // "ipc" is required by fork(); the protocol itself runs over the stdin/stdout pipes.
       stdio: ["pipe", "pipe", "pipe", "ipc"],
       env,
+      // Unix: own process group, so the whole tree can be killed with one signal on exit.
+      detached: platform() !== "win32",
     });
     this.child.stdout!.setEncoding("utf8");
     this.child.stdout!.on("data", (chunk: string) => this.onStdout(chunk));
@@ -198,6 +274,15 @@ export class ZcodeProtocolClient extends EventEmitter {
     this.child.on("exit", (code, signal) => {
       this.booted = false;
       this.child = null;
+      this.stopTimers();
+      for (const [sid, t] of this.activeTurns) {
+        t.resolveCaller?.({ ok: false, error: { code: "app_server_exit", message: `app-server exited (${signal ?? code})` } });
+        if (t.graceTimer) clearTimeout(t.graceTimer);
+        for (const w of t.endWaiters) w();
+        this.ledger.close(sid);
+      }
+      this.activeTurns.clear();
+      for (const sid of this.ledger.residentIds()) this.ledger.close(sid);
       for (const [, p] of this.pending) p.reject(new ZcodeProtocolError(`app-server exited (${signal ?? code})`));
       this.pending.clear();
       // A child that dies before signaling startup must not stall start() for 30s;
@@ -216,12 +301,30 @@ export class ZcodeProtocolClient extends EventEmitter {
     // none can be) before declaring the client usable.
     await this.waitForModels();
     this.booted = true;
+    this.startReaper();
   }
 
+  /** Kill the app-server and everything it spawned. */
   async stop(): Promise<void> {
-    this.child?.kill("SIGKILL");
+    this.stopSync();
+  }
+
+  /** Synchronous stop for exit handlers: the whole app-server tree goes down. */
+  stopSync(): void {
+    this.stopTimers();
+    const child = this.child;
     this.child = null;
     this.booted = false;
+    if (!child) return;
+    if (child.pid && this.lifecycle.reapEnabled) killTreeSync(child.pid);
+    try { child.kill("SIGKILL"); } catch { /* gone */ }
+  }
+
+  private stopTimers(): void {
+    if (this.reaperTimer) clearInterval(this.reaperTimer);
+    if (this.sweepTimer) clearTimeout(this.sweepTimer);
+    this.reaperTimer = null;
+    this.sweepTimer = null;
   }
 
   /** Create a session; returns {sessionId, models}. */
@@ -229,6 +332,7 @@ export class ZcodeProtocolClient extends EventEmitter {
     workspacePath: string,
     mode: PermissionMode = "yolo",
   ): Promise<{ sessionId: string; models: AvailableModel[] }> {
+    const openedAt = Date.now();
     const res = await this.request("session/create", {
       workspace: { workspacePath, workspaceKey: workspacePath },
       mode,
@@ -237,6 +341,7 @@ export class ZcodeProtocolClient extends EventEmitter {
     const snap = res?.value ?? res;
     const sessionId = snap?.session?.sessionId;
     if (!sessionId) throw new ZcodeProtocolError("session/create returned no sessionId");
+    this.ledger.open(sessionId, openedAt);
     await this.request("session/subscribe", { sessionId, deliveryKind: "desktop-continuous" }).catch(() => {});
     return { sessionId, models: extractModels(snap) };
   }
@@ -253,15 +358,24 @@ export class ZcodeProtocolClient extends EventEmitter {
 
   /** Re-attach to an existing session from a previous server run. */
   async resumeSession(sessionId: string, workspacePath?: string): Promise<{ sessionId: string }> {
+    const openedAt = Date.now();
     await this.request("session/resume", {
       sessionId,
       ...(workspacePath ? { workspace: { workspacePath, workspaceKey: workspacePath } } : {}),
     });
+    this.ledger.open(sessionId, openedAt);
     await this.request("session/subscribe", { sessionId, deliveryKind: "desktop-continuous" }).catch(() => {});
     return { sessionId };
   }
 
-  /** Run one turn: send a prompt and resolve when the turn completes or fails. */
+  /**
+   * Run one turn: send a prompt and resolve when the turn completes or fails.
+   *
+   * On timeout the caller gets a `turn_timeout` rejection but the turn is NOT
+   * stopped: it may finish in the background (e.g. land its commit) for up to
+   * `lifecycle.turnGraceMs`, then it is stopped, the session is closed and its
+   * processes are reaped. A new turn on the same session stops it first.
+   */
   async runTurn(
     sessionId: string,
     content: string,
@@ -269,28 +383,114 @@ export class ZcodeProtocolClient extends EventEmitter {
     reasoningLevel?: string,
     timeoutMs?: number,
   ): Promise<TurnResult> {
+    const previous = this.activeTurns.get(sessionId);
+    if (previous) {
+      this.logger(`stopping the background turn of ${sessionId} before a new one`);
+      // the session is about to be used again: its end must not close it
+      previous.releaseRequested = false;
+      await this.stopTurn(sessionId, 30_000);
+    }
+    const timeout = timeoutMs ?? 600_000;
+    const turn: ActiveTurn = {
+      startedAt: Date.now(),
+      resolveCaller: null,
+      timedOutAt: null,
+      graceTimer: null,
+      releaseRequested: false,
+      endWaiters: [],
+    };
+    this.activeTurns.set(sessionId, turn);
+    this.ledger.touch(sessionId);
     const waiter = new Promise<TurnResult>((resolve, reject) => {
       const t = setTimeout(() => {
-        this.turnWaiters.delete(sessionId);
-        this.request("session/stop", { sessionId }).catch(() => {});
-        reject(new ZcodeProtocolError(`turn timed out after ${timeoutMs}ms`, "turn_timeout"));
-      }, timeoutMs ?? 600_000);
-      this.turnWaiters.set(sessionId, (r) => {
+        turn.resolveCaller = null;
+        turn.timedOutAt = Date.now();
+        this.armGrace(sessionId, turn);
+        reject(new ZcodeProtocolError(`turn timed out after ${timeout}ms`, "turn_timeout"));
+      }, timeout);
+      turn.resolveCaller = (r) => {
         clearTimeout(t);
-        this.turnWaiters.delete(sessionId);
         resolve(r);
+      };
+    });
+    try {
+      await this.request("session/send", {
+        sessionId,
+        content,
+        modelSelection: {
+          providerId: model.providerId,
+          modelId: model.modelId,
+          ...(reasoningLevel ? { options: { reasoningLevel } } : {}),
+        },
       });
-    });
-    await this.request("session/send", {
-      sessionId,
-      content,
-      modelSelection: {
-        providerId: model.providerId,
-        modelId: model.modelId,
-        ...(reasoningLevel ? { options: { reasoningLevel } } : {}),
-      },
-    });
+    } catch (e) {
+      // Nothing is running: settle the waiter silently and drop the turn.
+      turn.resolveCaller?.({ ok: false });
+      if (this.activeTurns.get(sessionId) === turn) this.activeTurns.delete(sessionId);
+      throw e;
+    }
     return waiter;
+  }
+
+  /** A turn that is still running after its caller timed out. */
+  isTurnInGrace(sessionId: string): boolean {
+    return this.activeTurns.get(sessionId)?.timedOutAt != null;
+  }
+
+  private armGrace(sessionId: string, turn: ActiveTurn): void {
+    // The caller is gone; whoever ends this turn also closes the session.
+    turn.releaseRequested = true;
+    turn.graceTimer = setTimeout(() => {
+      turn.graceTimer = null;
+      if (this.activeTurns.get(sessionId) !== turn) return;
+      this.logger(`grace of ${this.lifecycle.turnGraceMs}ms expired for ${sessionId}; stopping the turn`);
+      void this.stopTurn(sessionId, 30_000);
+    }, this.lifecycle.turnGraceMs);
+    turn.graceTimer.unref?.();
+  }
+
+  /** session/stop, then wait for the turn to end (forced after waitMs). */
+  private async stopTurn(sessionId: string, waitMs: number): Promise<void> {
+    const turn = this.activeTurns.get(sessionId);
+    if (!turn) return;
+    const ended = new Promise<void>((r) => turn.endWaiters.push(r));
+    await this.request("session/stop", { sessionId }).catch(() => {});
+    let timer: NodeJS.Timeout | undefined;
+    const forced = new Promise<"forced">((r) => {
+      timer = setTimeout(() => r("forced"), waitMs);
+    });
+    const how = await Promise.race([ended.then(() => "ended" as const), forced]);
+    clearTimeout(timer);
+    if (how === "forced" && this.activeTurns.get(sessionId) === turn) {
+      this.finishTurn(sessionId, { ok: false, error: { code: "turn_stopped", message: "turn did not end after session/stop" } });
+    }
+  }
+
+  /** Single exit path of a turn: its end event, or a forced stop. */
+  private finishTurn(sessionId: string, result: TurnResult): void {
+    const turn = this.activeTurns.get(sessionId);
+    if (!turn) return;
+    this.activeTurns.delete(sessionId);
+    if (turn.graceTimer) clearTimeout(turn.graceTimer);
+    turn.resolveCaller?.(result);
+    turn.resolveCaller = null;
+    for (const w of turn.endWaiters) w();
+    this.ledger.touch(sessionId);
+    if (turn.releaseRequested) void this.disposeSession(sessionId);
+  }
+
+  /**
+   * The caller is done with this session for now: close its runtime on the
+   * app-server (it stays on disk and resumes by id) and reap its processes.
+   * A turn still running in grace closes the session when it ends.
+   */
+  async releaseSession(sessionId: string): Promise<void> {
+    const turn = this.activeTurns.get(sessionId);
+    if (turn) {
+      turn.releaseRequested = true;
+      return;
+    }
+    await this.disposeSession(sessionId);
   }
 
   async readMessages(sessionId: string): Promise<SessionMessage[]> {
@@ -306,8 +506,98 @@ export class ZcodeProtocolClient extends EventEmitter {
     return (res?.sessions ?? res?.value ?? []) as any[];
   }
 
+  /** Close the session runtime on the app-server and reap the processes it leaves behind. */
   async disposeSession(sessionId: string): Promise<void> {
     await this.request("session/close", { sessionId }).catch(() => {});
+    this.ledger.close(sessionId);
+    this.scheduleSweep();
+  }
+
+  // ---- process lifecycle -------------------------------------------------------
+
+  private startReaper(): void {
+    if (this.reaperTimer) return;
+    this.reaperTimer = setInterval(() => void this.idleTick(), this.lifecycle.reapIntervalMs);
+    this.reaperTimer.unref?.();
+    if (this.lifecycle.reapEnabled) void this.reapOrphanAppServers();
+  }
+
+  /** Close sessions idle longer than sessionIdleMs, then sweep. */
+  async idleTick(now = Date.now()): Promise<void> {
+    for (const sid of this.ledger.residentIds()) {
+      if (this.activeTurns.has(sid)) continue;
+      const last = this.ledger.lastActivity(sid) ?? 0;
+      if (now - last >= this.lifecycle.sessionIdleMs) {
+        this.logger(`session ${sid} idle for ${Math.round((now - last) / 1000)}s; closing`);
+        await this.request("session/close", { sessionId: sid }).catch(() => {});
+        this.ledger.close(sid);
+      }
+    }
+    await this.sweep();
+  }
+
+  /** Debounced sweep: the app-server settles its own children for a moment after close. */
+  private scheduleSweep(delayMs = 2_000): void {
+    if (!this.lifecycle.reapEnabled || this.sweepTimer || !this.child) return;
+    this.sweepTimer = setTimeout(() => {
+      this.sweepTimer = null;
+      void this.sweep();
+    }, delayMs);
+    this.sweepTimer.unref?.();
+  }
+
+  /** Kill app-server children whose owning sessions are all closed. Returns how many subtrees were killed. */
+  sweep(): Promise<number> {
+    if (this.sweeping) return this.sweeping;
+    this.sweeping = (async () => {
+      const root = this.child?.pid;
+      if (!root || !this.lifecycle.reapEnabled) return 0;
+      try {
+        const all = await listProcesses();
+        let killed = 0;
+        for (const d of planReap(all, root, this.ledger)) {
+          if (!d.kill) continue;
+          this.logger(`reap pid ${d.proc.pid} (${d.proc.name}): ${d.reason}`);
+          await killTree(d.proc.pid, all);
+          killed++;
+        }
+        this.ledger.prune();
+        return killed;
+      } catch (e) {
+        this.logger(`sweep failed: ${e instanceof Error ? e.message : String(e)}`);
+        return 0;
+      } finally {
+        this.sweeping = null;
+      }
+    })();
+    return this.sweeping;
+  }
+
+  /** App-servers of zcode-mcp instances that died without cleaning up (parent gone). */
+  private async reapOrphanAppServers(): Promise<void> {
+    try {
+      const all = await listProcesses();
+      for (const p of findOrphanAppServers(all, this.child?.pid ?? -1)) {
+        this.logger(`killing orphaned app-server tree ${p.pid} (parent ${p.ppid} is gone)`);
+        await killTree(p.pid, all);
+      }
+    } catch { /* best effort */ }
+  }
+
+  /** Live process tree of the app-server, for diagnostics. */
+  async processStats(): Promise<ProcessStats> {
+    const root = this.child?.pid ?? null;
+    const base = {
+      appServerPid: root,
+      residentSessions: this.ledger.residentIds(),
+      runningTurns: [...this.activeTurns.keys()],
+      graceTurns: [...this.activeTurns.entries()].filter(([, t]) => t.timedOutAt !== null).map(([id]) => id),
+    };
+    if (!root) return { ...base, children: [], memBytes: 0 };
+    const all = await listProcesses();
+    const children = descendants(all, root);
+    const self = all.find((p) => p.pid === root);
+    return { ...base, children, memBytes: sumMemory(children) + (self?.memBytes ?? 0) };
   }
 
   // ---- internals -------------------------------------------------------------
@@ -481,16 +771,18 @@ export class ZcodeProtocolClient extends EventEmitter {
       // Event type lives at params.type (top level); payload.type appears on some variants.
       const type = (msg.params?.type ?? payload.type) as string | undefined;
       if (type === "turn.completed" || type === "turn.failed" || type === "turn.ended") {
-        this.logger(`turn event ${type} (sessionId=${sid ?? "?"}, waiters=${this.turnWaiters.size})`);
-        const waiter =
-          (sid ? this.turnWaiters.get(sid) : undefined) ??
-          (this.turnWaiters.size === 1 ? [...this.turnWaiters.values()][0] : undefined);
-        if (waiter) {
-          waiter({
+        this.logger(`turn event ${type} (sessionId=${sid ?? "?"}, active=${this.activeTurns.size})`);
+        const target =
+          (sid && this.activeTurns.has(sid) ? sid : undefined) ??
+          (!sid && this.activeTurns.size === 1 ? [...this.activeTurns.keys()][0] : undefined);
+        if (target) {
+          this.finishTurn(target, {
             ok: type !== "turn.failed",
             error: payload.error ? { code: payload.error.code, message: payload.error.message } : undefined,
           });
         }
+      } else if (sid) {
+        this.ledger.touch(sid);
       }
       return;
     }
