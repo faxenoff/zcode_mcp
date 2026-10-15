@@ -93,10 +93,45 @@ claude mcp add zcode -- node <repo>/dist/index.js
 | `ZCODE_MCP_AUTO_PROXY` | `1` | 自动检测 macOS 系统代理并透传给 zcode 子进程(`0` 关闭) |
 | `ZCODE_MCP_DEBUG` | – | `1` 时向 stderr 输出调试日志 |
 | `ZCODE_CREDENTIAL_SECRET` | 机器指纹派生 | zcode 凭据加密密钥(与 zcode 客户端一致,一般无需设置) |
+| `ZCODE_ENTITLED_PROVIDERS` | from desktop log | comma list of account providers to mark entitled (overrides detection) |
+| `ZCODE_CLIENT_VERSION` | newest `~/.zcode/v2/runtime/provider/<os>-<cpu>/<version>` | `clientVersion` of the project-token request |
 | `ZCODE_TURN_GRACE_MS` | `600000` (10 min) | after a `zcode_run` times out, the turn may keep running this long, then it is stopped and its processes are killed (see "Process lifecycle") |
 | `ZCODE_SESSION_IDLE_MS` | `1800000` (30 min) | an open session with no turn for this long is closed and its processes are killed (the session stays on disk) |
 | `ZCODE_REAP_INTERVAL_MS` | `60000` | how often the idle / orphan sweep runs |
 | `ZCODE_REAP` | `1` | `0` = never kill processes (sessions are still closed after each turn) |
+
+## Credentials (ZCode 3.15+ OAuth login)
+
+ZCode 3.15 no longer stores a coding-plan api key. `~/.zcode/v2/credentials.json` (values
+`enc:v1:...`, AES-256-GCM, key derived from the machine fingerprint) now holds:
+
+| key | content (decrypted) |
+|---|---|
+| `oauth:active_provider` | `zai` or `bigmodel` |
+| `oauth:<family>:access_token` | business-API login token (a JWT with `user_id` / `customer_id` claims) |
+| `oauth:<family>:user_info` | `{user_id, email, name, avatar}` |
+| `project-key-location:v1:<urlencoded [origin, family, user_id, null, 1, "non-team"]>` | `{organizationId, projectId, apiKeyId}` — one per account ever logged in |
+| `zcodejwttoken`, `oauth:login_attribution` | not used here |
+
+The key sent with model requests is a short-lived **project access token**, minted exactly as the
+desktop host does it: `POST https://api.z.ai/api/biz/v1/organization/<org>/projects/<project>/api_keys/<apiKeyId>/access_tokens`
+with `Authorization: Bearer <access_token>` and `{clientType: "zcode", clientVersion}` →
+`{data: {enabled, accessToken, expiresIn (~4.8 h), expiresAt}}`. zcode-mcp answers
+`interaction/requestProviderRuntimeHeaders` with `requestAuth: {apiKey: accessToken, apiKeyId}`
+and caches the token until 2 min before expiry. The pointer of the *current* user (`user_info.user_id`)
+is used; without one, the existing `zcode-api-key` of the personal default project is looked up
+(read-only). If the stored token is rejected it is exchanged via `POST /api/auth/z/login` first.
+The legacy format (`account-provider:coding-plan:<provider>:account:<id>:api-key`, ZCode ≤ 3.14)
+is still read first.
+
+Which account providers are entitled is decided by the account server, so it is taken from the
+desktop host's last push to its own agent (`account provider config ... receivedRevision` in
+`~/.zcode/v2/logs/*.log`); without that line the family's individual, start and off-peak plans are
+assumed. `ZCODE_ENTITLED_PROVIDERS=<id,id>` overrides both. Model choice prefers `ZCODE_PROVIDER`,
+then other providers, and **start plans last**: the desktop gates the free start plan behind an
+interactive captcha (`X-Aliyun-Captcha-Verify-*`), so headless turns on it fail with
+`Provider authentication failed`. Switching accounts in the desktop app needs no restart of the
+MCP server for the key (it is re-read per request), but the entitlement push happens at boot.
 
 ## Process lifecycle
 

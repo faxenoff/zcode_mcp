@@ -29,9 +29,9 @@ import {
   readSync,
   closeSync,
 } from "node:fs";
-import { arch, homedir, platform, tmpdir, userInfo } from "node:os";
+import { arch, homedir, platform, tmpdir } from "node:os";
 import { dirname, isAbsolute, join, resolve } from "node:path";
-import { createHash, createDecipheriv } from "node:crypto";
+import { createHash } from "node:crypto";
 import { EventEmitter } from "node:events";
 import {
   SessionLedger,
@@ -44,6 +44,16 @@ import {
   sumMemory,
   type ProcInfo,
 } from "./processes.js";
+import {
+  CodingPlanAuthError,
+  ProjectTokenResolver,
+  familyOf,
+  hasLegacyKeys,
+  legacyApiKey,
+  oauthFamilies,
+  oauthLogin,
+  readStore,
+} from "./auth.js";
 
 export const DEFAULT_ZCODE_BIN =
   platform() === "win32"
@@ -59,7 +69,50 @@ const ACCOUNT_PROVIDERS = [
   "account:bigmodel-start-plan",
   "account:zai-offpeak-idle-plan",
   "account:bigmodel-offpeak-idle-plan",
+  "account:zai-highspeed-card",
+  "account:bigmodel-highspeed-card",
 ] as const;
+
+/** What the desktop app last pushed to its own agent (entitlements come from the account server). */
+export interface DesktopAccountSnapshot {
+  providers: Record<string, Record<string, unknown>>;
+  states: Record<string, Record<string, unknown>>;
+}
+
+/**
+ * Parse the desktop host's "account provider config ... receivedRevision" log line:
+ * `"receivedRevision":"account:[<builtin rev>, [{providerId, config}...], {<providerId>: state}]"`.
+ */
+export function parseDesktopAccountLine(line: string): DesktopAccountSnapshot | null {
+  const m = /"receivedRevision":("account:(?:[^"\\]|\\.)*")/.exec(line);
+  if (!m) return null;
+  try {
+    const inner = (JSON.parse(m[1]) as string).slice("account:".length);
+    const [, list, states] = JSON.parse(inner) as [string, { providerId: string; config: Record<string, unknown> }[], Record<string, Record<string, unknown>>];
+    if (!Array.isArray(list) || !states || typeof states !== "object") return null;
+    const providers: Record<string, Record<string, unknown>> = {};
+    for (const e of list) if (e && typeof e.providerId === "string" && e.config) providers[e.providerId] = e.config;
+    return { providers, states };
+  } catch {
+    return null;
+  }
+}
+
+/** The newest such line in ~/.zcode/v2/logs (desktop app logs), or null. */
+export function readDesktopAccountSnapshot(dir = join(homedir(), ".zcode/v2/logs")): DesktopAccountSnapshot | null {
+  try {
+    const files = readdirSync(dir).filter((f) => f.endsWith(".log")).sort();
+    for (let i = files.length - 1; i >= Math.max(0, files.length - 7); i--) {
+      const lines = readFileSync(join(dir, files[i]), "utf8").split("\n");
+      for (let j = lines.length - 1; j >= 0; j--) {
+        if (!lines[j].includes('"receivedRevision":"account:[')) continue;
+        const snap = parseDesktopAccountLine(lines[j]);
+        if (snap) return snap;
+      }
+    }
+  } catch { /* no desktop logs */ }
+  return null;
+}
 
 export type PermissionMode = "plan" | "build" | "edit" | "yolo" | "auto";
 
@@ -177,6 +230,7 @@ export class ZcodeProtocolClient extends EventEmitter {
   private reaperTimer: NodeJS.Timeout | null = null;
   private sweepTimer: NodeJS.Timeout | null = null;
   private sweeping: Promise<number> | null = null;
+  private readonly tokens = new ProjectTokenResolver();
   private booted = false;
   private buffer = "";
   private startWaiters: (() => void)[] = [];
@@ -728,22 +782,10 @@ export class ZcodeProtocolClient extends EventEmitter {
     return new Promise((r) => setTimeout(r, ms));
   }
 
-  /** Any coding-plan api key in the zcode credential store (any provider id)? */
+  /** Any usable zcode login: a legacy coding-plan api key or an OAuth login (ZCode 3.15+). */
   private hasAnyAccountCredential(): boolean {
-    try {
-      const path = join(homedir(), ".zcode/v2/credentials.json");
-      if (!existsSync(path)) return false;
-      const cred = JSON.parse(readFileSync(path, "utf8")) as Record<string, string>;
-      return Object.entries(cred).some(
-        ([k, v]) =>
-          k.startsWith("account-provider:coding-plan:") &&
-          k.endsWith(":api-key") &&
-          typeof v === "string" &&
-          v.trim().length > 0,
-      );
-    } catch {
-      return false;
-    }
+    const store = readStore();
+    return hasLegacyKeys(store) || oauthFamilies(store).length > 0;
   }
 
   private handleMessage(msg: any): void {
@@ -798,13 +840,7 @@ export class ZcodeProtocolClient extends EventEmitter {
     }
     if (msg.method === "interaction/requestProviderRuntimeHeaders") {
       const providerId = msg.params?.providerId as string | undefined;
-      const apiKey = providerId ? this.readProviderApiKey(providerId) : null;
-      this.respond(
-        msg.id,
-        apiKey
-          ? { headersApplied: true, requestAuth: { apiKey } }
-          : { headersApplied: false, errorMessage: `no credential found for ${providerId}` },
-      );
+      void this.providerRuntimeHeaders(providerId).then((r) => this.respond(msg.id, r));
       return;
     }
     // Permission / user-input / official-mcp-auth interactions: deny (headless callers cannot answer).
@@ -874,7 +910,8 @@ export class ZcodeProtocolClient extends EventEmitter {
           const dir = join(homedir(), ".zcode-mcp");
           mkdirSync(dir, { recursive: true });
           const copy = join(dir, "zcode-builtin.json");
-          if (!existsSync(copy)) copyFileSync(shipped, copy);
+          // refresh after a ZCode update (the shipped revision changes with it)
+          if (!existsSync(copy) || readFileSync(copy, "utf8") !== readFileSync(shipped, "utf8")) copyFileSync(shipped, copy);
           env.ZCODE_BUILTIN_PROVIDER_CONFIG_FILE = copy;
           env.ZCODE_PERSONAL_PROVIDER_CONFIG_FILE = join(homedir(), ".zcode/v2/provider_config.json");
         }
@@ -912,21 +949,77 @@ export class ZcodeProtocolClient extends EventEmitter {
     return env;
   }
 
+  /** Answer for interaction/requestProviderRuntimeHeaders (never rejects). */
+  async providerRuntimeHeaders(providerId: string | undefined): Promise<Record<string, unknown>> {
+    if (!providerId) return { headersApplied: false, errorMessage: "no providerId" };
+    const store = readStore();
+    const legacy = legacyApiKey(store, providerId);
+    if (legacy) return { headersApplied: true, requestAuth: { apiKey: legacy } };
+    const family = familyOf(providerId);
+    const login = family ? oauthLogin(store, family) : null;
+    if (!login) return { headersApplied: false, errorMessage: `no credential found for ${providerId}` };
+    try {
+      const { apiKey, apiKeyId } = await this.tokens.resolve(login, store);
+      return { headersApplied: true, requestAuth: { apiKey, apiKeyId } };
+    } catch (e) {
+      const msg = e instanceof CodingPlanAuthError ? e.message : `project token request failed: ${e instanceof Error ? e.message : String(e)}`;
+      this.logger(`runtime headers for ${providerId} failed: ${msg}`);
+      return { headersApplied: false, errorMessage: msg };
+    }
+  }
+
+  /**
+   * Which account providers are entitled, and which is current.
+   * 1. legacy api keys (ZCode <= 3.14): a provider with a stored key is entitled;
+   * 2. OAuth login (3.15+): the desktop host's last push to its own agent, read from its log
+   *    (entitlements come from the account server, we cannot derive them locally);
+   * 3. OAuth without such a log line: the family's individual, start and off-peak plans.
+   * ZCODE_ENTITLED_PROVIDERS (comma list) overrides all of it. The preferred provider
+   * (ZCODE_PROVIDER) is always marked current when entitled.
+   */
+  accountProviderPlan(): { providers: Record<string, Record<string, unknown>>; states: Record<string, Record<string, unknown>> } {
+    const preferred = process.env.ZCODE_PROVIDER ?? "account:bigmodel-individual-coding-plan";
+    const store = readStore();
+    const families = oauthFamilies(store);
+    const override = (process.env.ZCODE_ENTITLED_PROVIDERS ?? "").split(",").map((x) => x.trim()).filter(Boolean);
+    const snap = override.length || hasLegacyKeys(store) || !families.length ? null : readDesktopAccountSnapshot();
+    const providers: Record<string, Record<string, unknown>> = {};
+    const states: Record<string, Record<string, unknown>> = {};
+    const ids = new Set<string>([...ACCOUNT_PROVIDERS, ...Object.keys(snap?.providers ?? {})]);
+    const legacyPreferred = legacyApiKey(store, preferred) !== null;
+    for (const p of ids) {
+      let entitled: boolean;
+      let current: boolean | undefined;
+      if (override.length) {
+        entitled = override.includes(p);
+      } else if (hasLegacyKeys(store)) {
+        entitled = legacyApiKey(store, p) !== null && (!legacyPreferred || p === preferred);
+      } else if (snap) {
+        entitled = snap.states[p]?.entitled === true || (snap.providers[p]?.access as { entitled?: boolean } | undefined)?.entitled === true;
+        current = snap.states[p]?.current === true;
+      } else {
+        const fam = familyOf(p);
+        entitled = !!fam && families.includes(fam) && /-(individual-coding|start|offpeak-idle)-plan$/.test(p);
+      }
+      const config: Record<string, unknown> = { ...(snap?.providers[p] ?? {}), access: { type: "zhipu-account", entitled } };
+      providers[p] = config;
+      states[p] = {
+        availability: entitled ? "available" : "unavailable",
+        entitled,
+        ...(entitled && (current || p === preferred) ? { current: true } : { current: false }),
+      };
+    }
+    // At least one current entitled provider, or the registry exposes nothing.
+    if (!Object.values(states).some((st) => st.current === true)) {
+      const first = Object.keys(states).find((p) => states[p].entitled === true);
+      if (first) states[first].current = true;
+    }
+    return { providers, states };
+  }
+
   /** Push account provider definitions, mirroring the ZCode desktop app. */
   private async pushAccountProviders(basedOnRevision?: string): Promise<void> {
-    const providers: Record<string, { access: { type: string; entitled: boolean } }> = {};
-    const states: Record<string, Record<string, unknown>> = {};
-    const preferred = process.env.ZCODE_PROVIDER ?? "account:bigmodel-individual-coding-plan";
-    let currentSet = false;
-    for (const p of ACCOUNT_PROVIDERS) {
-      const hasCred = this.readProviderApiKey(p) !== null;
-      const isPreferred = p === preferred;
-      const entitled = hasCred && (!this.readProviderApiKey(preferred) || isPreferred);
-      const current = entitled && !currentSet;
-      providers[p] = { access: { type: "zhipu-account", entitled } };
-      states[p] = { availability: entitled ? "available" : "unavailable", entitled, current };
-      if (current) currentSet = true;
-    }
+    const { providers, states } = this.accountProviderPlan();
     const basedOn = basedOnRevision ?? this.readBuiltinRevision();
     this.pushedBuiltinRevision = basedOn;
     await this.request("provider/updateAccountConfig", {
@@ -1001,37 +1094,9 @@ export class ZcodeProtocolClient extends EventEmitter {
     );
   }
 
-  /** Find + decrypt the coding-plan api key for a provider from the zcode credential store. */
+  /** Legacy (ZCode <= 3.14) stored coding-plan api key for a provider, decrypted. */
   readProviderApiKey(providerId: string): string | null {
-    try {
-      const path = join(homedir(), ".zcode/v2/credentials.json");
-      if (!existsSync(path)) return null;
-      const cred = JSON.parse(readFileSync(path, "utf8")) as Record<string, string>;
-      const prefix = `account-provider:coding-plan:${providerId}:account:`;
-      for (const [k, v] of Object.entries(cred)) {
-        if (k.startsWith(prefix) && k.endsWith(":api-key") && typeof v === "string" && v.trim()) {
-          return this.decryptCredential(v.trim());
-        }
-      }
-    } catch { /* best effort */ }
-    return null;
-  }
-
-  /** zcode credential store values: "enc:v1:<iv>.<tag>.<ciphertext>", aes-256-gcm, base64url parts. */
-  private decryptCredential(v: string): string {
-    if (!v.startsWith("enc:v1:")) return v;
-    const secret =
-      (process.env.ZCODE_CREDENTIAL_SECRET ?? "").trim() ||
-      `zcode-credential-fallback:${platform()}:${homedir()}:${userInfo().username}`;
-    const key = createHash("sha256").update(secret).digest();
-    const parts = v.slice("enc:v1:".length).split(".");
-    if (parts.length !== 3) throw new ZcodeProtocolError("credential: invalid ciphertext format");
-    const iv = Buffer.from(parts[0], "base64url");
-    const tag = Buffer.from(parts[1], "base64url");
-    const ct = Buffer.from(parts[2], "base64url");
-    const d = createDecipheriv("aes-256-gcm", key, iv);
-    d.setAuthTag(tag);
-    return Buffer.concat([d.update(ct), d.final()]).toString("utf8");
+    return legacyApiKey(readStore(), providerId);
   }
 }
 

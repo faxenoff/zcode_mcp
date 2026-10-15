@@ -41,9 +41,17 @@ export interface ModelChoice {
 export function pickModel(models: AvailableModel[], requested?: string, readiness?: ModelsReadiness): ModelChoice {
   if (!models.length) throw noModelsError(readiness);
   const want = (requested?.trim() || process.env.ZCODE_MODEL || "").toLowerCase();
+  // Several account providers can expose the same model id (e.g. individual coding plan and
+  // start plan both list GLM-5.3): the preferred provider (ZCODE_PROVIDER) wins, any other
+  // provider is the fallback when the preferred one exposes nothing suitable.
+  const preferred = process.env.ZCODE_PROVIDER?.trim();
+  // Start plans are last: the desktop gates them behind an interactive captcha
+  // (X-Aliyun-Captcha-Verify-*), so headless requests to them fail authentication.
+  const rank = (m: AvailableModel) => (m.providerId === preferred ? 0 : /-start-plan$/.test(m.providerId) ? 2 : 1);
+  const ordered = [...models].sort((a, b) => rank(a) - rank(b));
   let model: AvailableModel | undefined;
   if (want) {
-    model = models.find(
+    model = ordered.find(
       (m) =>
         m.modelId.toLowerCase() === want ||
         `${m.providerId}/${m.modelId}`.toLowerCase() === want ||
@@ -55,7 +63,7 @@ export function pickModel(models: AvailableModel[], requested?: string, readines
       );
     }
   } else {
-    model = models.find((m) => m.modelId === "GLM-5.3") ?? models[0];
+    model = ordered.find((m) => m.modelId === "GLM-5.3") ?? ordered[0];
   }
   const reasoning = process.env.ZCODE_REASONING?.trim() || model.reasoning?.defaultLevel || "max";
   return { model, reasoning };

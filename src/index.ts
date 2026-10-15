@@ -20,6 +20,7 @@ import {
   type SessionMessage,
 } from "./protocol.js";
 import { ModelCache, pickModel } from "./models.js";
+import { hasLegacyKeys, oauthFamilies, readStore } from "./auth.js";
 
 const debug = process.env.ZCODE_MCP_DEBUG === "1";
 const log = (msg: string) => {
@@ -300,11 +301,17 @@ server.registerTool(
     try {
       const c = await getClient();
       const credDir = `${homedir()}/.zcode/v2/credentials.json`;
-      const hasCred = existsSync(credDir);
+      const store = readStore(credDir);
+      const families = oauthFamilies(store);
+      const credKind = [
+        ...(families.length ? [`OAuth login: ${families.join(", ")} (ZCode 3.15+, project access tokens)`] : []),
+        ...(hasLegacyKeys(store) ? ["stored coding-plan api keys (ZCode <= 3.14)"] : []),
+      ];
+      const hasCred = credKind.length > 0;
       const preferred = process.env.ZCODE_PROVIDER ?? "account:bigmodel-individual-coding-plan";
       const ws = resolveCwd(undefined);
       const probe = await c.createSession(ws, "plan");
-      const models = probe.models.map((m) => m.modelId);
+      const models = probe.models.map((m) => `${m.modelId} (${m.providerId.replace(/^account:/, "")})`);
       cachedModels.set(ws, probe.models);
       await c.disposeSession(probe.sessionId).catch(() => {});
       let status: string;
@@ -340,7 +347,7 @@ server.registerTool(
       }
       const lines = [
         `binary: ${c.binaryPath}`,
-        `credentials: ${hasCred ? `found (${credDir})` : `MISSING — log in via the ZCode desktop app`}`,
+        `credentials: ${hasCred ? `found — ${credKind.join("; ")} (${credDir})` : `MISSING — log in via the ZCode desktop app`}`,
         `preferred_provider: ${preferred}`,
         `models: ${models.join(", ") || "(none)"}`,
         `status: ${status}`,
