@@ -202,3 +202,30 @@ test("an intentional stop is reported as a stop, not a death", async () => {
   const r = await t;
   assert.match(r.error.message, /^app-server stopped \(SIGKILL\)$/);
 });
+
+/** Answer one session/requestRuntimePreferences from a fake app-server and return what we said. */
+function runtimePreferencesOf(c) {
+  const written = [];
+  c.child = { pid: undefined, stdin: { write(line) { written.push(JSON.parse(line)); return true; } } };
+  c.handleMessage({ id: 77, method: "session/requestRuntimePreferences", params: { sessionId: SID, scope: "runtime-materialization" } });
+  const reply = written.find((m) => m.id === 77);
+  assert.ok(reply, "runtime preferences were not answered");
+  return reply.result;
+}
+
+test("project memory is off by default: closing a session then has no memory extraction to abort", () => {
+  const saved = process.env.ZCODE_PROJECT_MEMORY;
+  try {
+    delete process.env.ZCODE_PROJECT_MEMORY;
+    const c = new ZcodeProtocolClient("x.cjs");
+    assert.equal(c.lifecycle.projectMemory, false);
+    assert.equal(runtimePreferencesOf(c).memoryEnabled, false);
+    process.env.ZCODE_PROJECT_MEMORY = "1";
+    const on = new ZcodeProtocolClient("x.cjs");
+    assert.equal(on.lifecycle.projectMemory, true);
+    assert.equal(runtimePreferencesOf(on).memoryEnabled, true);
+  } finally {
+    if (saved === undefined) delete process.env.ZCODE_PROJECT_MEMORY;
+    else process.env.ZCODE_PROJECT_MEMORY = saved;
+  }
+});

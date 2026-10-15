@@ -163,6 +163,14 @@ export interface LifecycleConfig {
   reapIntervalMs: number;
   /** false = never kill processes (sessions are still closed after each turn). */
   reapEnabled: boolean;
+  /**
+   * ZCode project memory for our sessions (env ZCODE_PROJECT_MEMORY=1). Off by
+   * default: with it on, every turn end schedules a background
+   * `project_memory_extract`, and `session/close` aborts it — ZCode leaks that
+   * abort as an unhandled rejection, which shuts the whole app-server down with
+   * every other session's turn (ZCode 3.15.3, see README "Known ZCode issues").
+   */
+  projectMemory: boolean;
 }
 
 function envMs(name: string, dflt: number): number {
@@ -178,6 +186,7 @@ export function lifecycleFromEnv(): LifecycleConfig {
     sessionIdleMs: envMs("ZCODE_SESSION_IDLE_MS", 1_800_000),
     reapIntervalMs: Math.max(1_000, envMs("ZCODE_REAP_INTERVAL_MS", 60_000)),
     reapEnabled: process.env.ZCODE_REAP !== "0",
+    projectMemory: process.env.ZCODE_PROJECT_MEMORY === "1",
   };
 }
 
@@ -907,7 +916,9 @@ export class ZcodeProtocolClient extends EventEmitter {
     if (msg.method === "session/requestRuntimePreferences") {
       this.respond(msg.id, {
         nativeSearchEnhancementsEnabled: true,
-        memoryEnabled: true,
+        // false => the session runtime gets memory.enabled=false: no memory reads,
+        // no post-turn extraction for session/close to abort (see LifecycleConfig).
+        memoryEnabled: this.lifecycle.projectMemory,
         askUserQuestionAutoResolutionEnabled: true,
         modelContextBudgetStrategy: "preflight-v1",
       });

@@ -99,6 +99,7 @@ claude mcp add zcode -- node <repo>/dist/index.js
 | `ZCODE_SESSION_IDLE_MS` | `1800000` (30 min) | an open session with no turn for this long is closed and its processes are killed (the session stays on disk) |
 | `ZCODE_REAP_INTERVAL_MS` | `60000` | how often the idle / orphan sweep runs |
 | `ZCODE_REAP` | `1` | `0` = never kill processes (sessions are still closed after each turn) |
+| `ZCODE_PROJECT_MEMORY` | `0` | `1` = ZCode project memory for zcode-mcp sessions (reads `~/.zcode/cli/memories` and extracts new memories after each turn). Off because of the app-server crash below |
 
 ## Credentials (ZCode 3.15+ OAuth login)
 
@@ -183,6 +184,21 @@ zcode-mcp now always appends to `~/.zcode-mcp/logs/app-server-<date>.log` (`[pid
 the cause of an `exit 1` can be found afterwards. Reaping never targets the app-server itself:
 closing one session kills only children no open session can own, and the app-server tree is
 killed only on zcode-mcp exit.
+
+**Known ZCode issue: closing a session can kill the app-server (ZCode 3.15.3).** With project
+memory on, the end of every turn schedules a background `project_memory_extract` (its own model
+request) about 0.7 s later. `session/close` runs `beginShutdown()` *before* draining that
+extraction, so the request is aborted at once. When the abort lands while the request is being
+prepared (13–40 ms after it started: all four crashes of 15.10.2026; 22 cancellations at 0–12 ms or
+≥ 246 ms were harmless), a promise inside ZCode rejects with that `AbortError` and nobody handles it:
+`unhandledRejection` → `requestShutdown("Uncaught process error")` → every session's turn is
+cancelled and the app-server exits 1. Stack in `app-server-<date>.log`:
+`AbortController.abort ← Object.shutdown (memory extraction scheduler) ← uD.beginShutdown ← close ←
+closeSession`; in `~/.zcode/cli/log/zcode-<date>.jsonl` the closed session's last events are
+`model.request.failed` / `model.retry.delay.resolved` with `querySource: project_memory_extract`.
+zcode-mcp therefore answers `session/requestRuntimePreferences` with `memoryEnabled: false`
+(unless `ZCODE_PROJECT_MEMORY=1`): the session runtime gets `memory.enabled=false`, no extraction
+is ever scheduled, and closing a session right after its turn has nothing to abort.
 
 TODO: the stdio MCP servers of `~/.zcode/cli/config.json` (e.g. code-daemon) are spawned for every
 zcode-mcp session too, and an app-server may die when one of them is killed from outside (seen
