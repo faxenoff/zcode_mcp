@@ -182,3 +182,11 @@ test("findOrphanAppServers: parent gone or pid reused; live parents are left alo
   assert.deepEqual(findOrphanAppServers(all, -1).map((p) => p.pid).sort(), [21, 31, 41]);
   assert.deepEqual(findOrphanAppServers(all, 21).map((p) => p.pid).sort(), [31, 41]);
 });
+
+test("planReap never selects the app-server itself, whatever the ledger says", () => {
+  const all = parseWindowsProcessJson(WIN_JSON);
+  all.push({ pid: 200, ppid: 200, name: "node.exe", cmd: "zcode.cjs app-server", createdMs: T - 590_000, memBytes: 1 });
+  const plan = planReap(all, 200, new SessionLedger(), { now: T });
+  assert.ok(!plan.some((d) => d.proc.pid === 200));
+  assert.ok(plan.every((d) => d.proc.ppid === 200), "only direct children are candidates");
+});

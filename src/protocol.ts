@@ -18,6 +18,7 @@ import {
   readFileSync,
   readdirSync,
   writeFileSync,
+  appendFileSync,
   statSync,
   mkdirSync,
   mkdtempSync,
@@ -231,6 +232,9 @@ export class ZcodeProtocolClient extends EventEmitter {
   private sweepTimer: NodeJS.Timeout | null = null;
   private sweeping: Promise<number> | null = null;
   private readonly tokens = new ProjectTokenResolver();
+  private stderrTail: string[] = [];
+  private stopping = false;
+  private lastExitMessage: string | null = null;
   private booted = false;
   private buffer = "";
   private startWaiters: (() => void)[] = [];
@@ -324,28 +328,14 @@ export class ZcodeProtocolClient extends EventEmitter {
       if (m && typeof m === "object") this.handleMessage(m);
     });
     this.child.stderr!.setEncoding("utf8");
-    this.child.stderr!.on("data", (c: string) => this.logger(`[app-server stderr] ${c.trim().slice(0, 400)}`));
-    this.child.on("exit", (code, signal) => {
-      this.booted = false;
-      this.child = null;
-      this.stopTimers();
-      for (const [sid, t] of this.activeTurns) {
-        t.resolveCaller?.({ ok: false, error: { code: "app_server_exit", message: `app-server exited (${signal ?? code})` } });
-        if (t.graceTimer) clearTimeout(t.graceTimer);
-        for (const w of t.endWaiters) w();
-        this.ledger.close(sid);
-      }
-      this.activeTurns.clear();
-      for (const sid of this.ledger.residentIds()) this.ledger.close(sid);
-      for (const [, p] of this.pending) p.reject(new ZcodeProtocolError(`app-server exited (${signal ?? code})`));
-      this.pending.clear();
-      // A child that dies before signaling startup must not stall start() for 30s;
-      // resolving lets the follow-up request fail fast with "app-server exited".
-      const waiters = this.startWaiters;
-      this.startWaiters = [];
-      for (const fn of waiters) fn();
-      this.emit("exit");
+    const pid = this.child.pid ?? 0;
+    this.stderrTail = [];
+    this.child.stderr!.on("data", (c: string) => {
+      this.logger(`[app-server stderr] ${c.trim().slice(0, 400)}`);
+      this.recordStderr(pid, c);
     });
+    const child = this.child;
+    this.child.on("exit", (code, signal) => this.onChildExit(child, code, signal));
 
     await this.waitForStartup();
     await this.pushAccountProviders();
@@ -358,6 +348,83 @@ export class ZcodeProtocolClient extends EventEmitter {
     this.startReaper();
   }
 
+  /**
+   * The app-server died (or was stopped). Every turn and request in flight is settled with
+   * an error that says so — callers must never be left with "app-server not running" from a
+   * follow-up request — and the next getClient() boots a fresh app-server (see index.ts).
+   */
+  onChildExit(child: ChildProcess | null, code: number | null, signal: NodeJS.Signals | null): void {
+    if (this.child === child) this.child = null;
+    this.booted = false;
+    this.stopTimers();
+    const intentional = this.stopping;
+    const open = new Set([...this.ledger.residentIds(), ...this.activeTurns.keys()]);
+    const status = signal ?? `exit ${code}`;
+    const cause = this.lastStderrError();
+    const message = intentional
+      ? `app-server stopped (${status})`
+      : `app-server died (${status}) with ${open.size} open session(s); every running turn was interrupted. ` +
+        `The next zcode_run starts a new app-server; continue a session with its session_id.` +
+        (cause ? ` Last app-server error: ${cause}.` : "") +
+        ` app-server stderr: ${this.stderrLogPath()}`;
+    if (!intentional) this.appendLog(child?.pid ?? 0, `[zcode-mcp] ${message}`);
+    this.lastExitMessage = message;
+    for (const [sid, t] of this.activeTurns) {
+      t.resolveCaller?.({ ok: false, error: { code: "app_server_exit", message } });
+      if (t.graceTimer) clearTimeout(t.graceTimer);
+      for (const w of t.endWaiters) w();
+      this.ledger.close(sid);
+    }
+    this.activeTurns.clear();
+    for (const sid of this.ledger.residentIds()) this.ledger.close(sid);
+    for (const [, p] of this.pending) p.reject(new ZcodeProtocolError(message, "app_server_exit"));
+    this.pending.clear();
+    // A child that dies before signaling startup must not stall start() for 30s;
+    // resolving lets the follow-up request fail fast with "app-server exited".
+    const waiters = this.startWaiters;
+    this.startWaiters = [];
+    for (const fn of waiters) fn();
+    this.emit("exit");
+  }
+
+  /** ~/.zcode-mcp/logs/app-server-<date>.log: app-server stderr is always kept (uncaught errors land there only). */
+  stderrLogPath(date = new Date()): string {
+    return join(homedir(), ".zcode-mcp", "logs", `app-server-${date.toISOString().slice(0, 10)}.log`);
+  }
+
+  private appendLog(pid: number, text: string): void {
+    try {
+      const path = this.stderrLogPath();
+      mkdirSync(dirname(path), { recursive: true });
+      const stamp = new Date().toISOString();
+      appendFileSync(path, text.split(/\r?\n/).filter((l) => l.trim()).map((l) => `${stamp} [${pid}] ${l}\n`).join(""));
+    } catch { /* logging must never break the protocol */ }
+  }
+
+  private recordStderr(pid: number, chunk: string): void {
+    this.appendLog(pid, chunk);
+    for (const line of chunk.split(/\r?\n/)) {
+      if (!line.trim()) continue;
+      this.stderrTail.push(line);
+      if (this.stderrTail.length > 200) this.stderrTail.shift();
+    }
+  }
+
+  /** Last stderr line that looks like an error (first line of a stack), for the exit message. */
+  private lastStderrError(): string | null {
+    for (let i = this.stderrTail.length - 1; i >= 0; i--) {
+      const l = this.stderrTail[i].trim();
+      if (/^\s*at\s/.test(l)) continue;
+      if (/error|exception|fatal|uncaught/i.test(l)) return l.slice(0, 300);
+    }
+    return null;
+  }
+
+  /** Message of the last app-server exit (null when it never died). */
+  get lastExit(): string | null {
+    return this.lastExitMessage;
+  }
+
   /** Kill the app-server and everything it spawned. */
   async stop(): Promise<void> {
     this.stopSync();
@@ -365,6 +432,7 @@ export class ZcodeProtocolClient extends EventEmitter {
 
   /** Synchronous stop for exit handlers: the whole app-server tree goes down. */
   stopSync(): void {
+    this.stopping = true;
     this.stopTimers();
     const child = this.child;
     this.child = null;
@@ -660,7 +728,14 @@ export class ZcodeProtocolClient extends EventEmitter {
     const id = this.nextId++;
     return new Promise((resolve, reject) => {
       if (!this.child?.stdin) {
-        reject(new ZcodeProtocolError(`app-server not running (${method})`, "no_child"));
+        reject(
+          new ZcodeProtocolError(
+            this.lastExitMessage
+              ? `app-server not running (${method}): ${this.lastExitMessage}`
+              : `app-server not running (${method})`,
+            "no_child",
+          ),
+        );
         return;
       }
       const timer = setTimeout(() => {

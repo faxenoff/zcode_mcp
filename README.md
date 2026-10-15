@@ -174,6 +174,22 @@ sessions that were open on the app-server when they started (±3 s). A child is 
 until the last of them closes. Children no open session explains are killed only when no session
 is open at all (and they are older than 10 s). The app-server's own `conhost.exe` is never touched.
 
+**When the app-server dies.** All sessions of a zcode-mcp instance live in one app-server, so
+its death interrupts every running turn. Each of them gets
+`zcode turn FAILED: app-server died (exit N) with K open session(s) ... Last app-server error: ...`
+plus its `session_id`; the next `zcode_run` boots a new app-server, and the session continues by
+`session_id` (history is on disk). The app-server writes uncaught errors only to stderr, which
+zcode-mcp now always appends to `~/.zcode-mcp/logs/app-server-<date>.log` (`[pid]` per line), so
+the cause of an `exit 1` can be found afterwards. Reaping never targets the app-server itself:
+closing one session kills only children no open session can own, and the app-server tree is
+killed only on zcode-mcp exit.
+
+TODO: the stdio MCP servers of `~/.zcode/cli/config.json` (e.g. code-daemon) are spawned for every
+zcode-mcp session too, and an app-server may die when one of them is killed from outside (seen
+around rebuilds of code-daemon, not proven). The app-server has no per-session MCP switch; the
+only knob is `ZCODE_HOME`, which would also move the session database. A separate config for
+zcode-mcp sessions would need that split first.
+
 `zcode_check` sweeps once and reports the tree, e.g.
 `processes: app-server pid 30100 + 2 children (code-daemon-mcp.exe×1, conhost.exe×1), 223 MB total; open sessions: 0, running turns: 0 (in grace: 0); reaped now: 4`.
 

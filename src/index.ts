@@ -229,6 +229,25 @@ server.registerTool(
       const result = await c.runTurn(sessionId, prompt, model, level, args.timeout_ms ?? 600_000);
       const durationS = Math.round((Date.now() - started) / 1000);
 
+      if (!result.ok && result.error?.code === "app_server_exit") {
+        // Nothing to read back: the app-server that held this turn is gone. The session is
+        // on disk; the next zcode_run boots a new app-server and resumes it by session_id.
+        opened = null;
+        return {
+          isError: true,
+          content: [
+            {
+              type: "text" as const,
+              text: `zcode turn FAILED: ${result.error.message}
+
+---
+session_id: ${sessionId}
+cwd: ${cwd}`,
+            },
+          ],
+        };
+      }
+
       const messages = await c.readMessages(sessionId);
       // Only summarize messages produced by THIS turn (resumed sessions carry full history).
       const summary = summarizeMessages(

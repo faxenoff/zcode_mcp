@@ -127,3 +127,78 @@ test("lifecycle defaults come from env", async () => {
     }
   }
 });
+
+test("three parallel turns: one finishes and is closed, the other two keep running", async () => {
+  const S2 = "sess_ffffffff-6666-4666-8666-666666666666";
+  const S3 = "sess_99999999-7777-4777-8777-777777777777";
+  const { c, calls } = fakeClient({});
+  c.ledger.open(S2);
+  c.ledger.open(S3);
+  const ev = (sid) => c.handleMessage({ method: "session/event", params: { sessionId: sid, type: "turn.completed", payload: {} } });
+  const t1 = c.runTurn(SID, "a", MODEL, "low", 5_000);
+  const t2 = c.runTurn(S2, "b", MODEL, "low", 5_000);
+  const t3 = c.runTurn(S3, "c", MODEL, "low", 5_000);
+  await tick(10);
+  ev(SID);
+  assert.equal((await t1).ok, true);
+  await c.releaseSession(SID);
+  assert.equal(c.ledger.isResident(SID), false);
+  assert.equal(c.ledger.isResident(S2), true);
+  assert.equal(c.ledger.isResident(S3), true);
+  assert.deepEqual(calls.filter((m) => m !== "session/send"), ["session/close"], "only the finished session is closed");
+  assert.ok(c.child, "the app-server is not touched");
+  ev(S2);
+  ev(S3);
+  assert.equal((await t2).ok, true);
+  assert.equal((await t3).ok, true);
+});
+
+test("app-server death settles every running turn with a clear error; later requests say why", async () => {
+  const saved = { home: process.env.HOME, up: process.env.USERPROFILE };
+  const { mkdtempSync, readFileSync } = await import("node:fs");
+  const { tmpdir } = await import("node:os");
+  const home = mkdtempSync(`${tmpdir()}/zcode-mcp-home-`);
+  process.env.HOME = home;
+  process.env.USERPROFILE = home;
+  try {
+    const S2 = "sess_ffffffff-6666-4666-8666-666666666666";
+    const { c } = fakeClient({});
+    c.ledger.open(S2);
+    const t1 = c.runTurn(SID, "a", MODEL, "low", 5_000);
+    const t2 = c.runTurn(S2, "b", MODEL, "low", 5_000);
+    await tick(10);
+    c.recordStderr(4242, "TypeError: Cannot read properties of undefined (reading 'x')\n    at foo (zcode.cjs:1:2)\n");
+    let exits = 0;
+    c.on("exit", () => exits++);
+    c.onChildExit(c.child, 1, null);
+    for (const r of [await t1, await t2]) {
+      assert.equal(r.ok, false);
+      assert.equal(r.error.code, "app_server_exit");
+      assert.match(r.error.message, /app-server died \(exit 1\) with 2 open session/);
+      assert.match(r.error.message, /TypeError: Cannot read properties/);
+    }
+    assert.equal(exits, 1, "index.ts drops the client on exit, so the next call boots a new app-server");
+    assert.equal(c.ledger.residentIds().length, 0);
+    await assert.rejects(c.readMessages(SID), (e) => e.code === "no_child" && /app-server died/.test(e.message));
+    const log = readFileSync(c.stderrLogPath(), "utf8");
+    assert.match(log, /\[4242\] TypeError/);
+    assert.match(log, /app-server died/);
+  } finally {
+    for (const [k, v] of [["HOME", saved.home], ["USERPROFILE", saved.up]]) {
+      if (v === undefined) delete process.env[k];
+      else process.env[k] = v;
+    }
+  }
+});
+
+test("an intentional stop is reported as a stop, not a death", async () => {
+  const { c } = fakeClient({});
+  const child = c.child;
+  child.kill = () => true;
+  const t = c.runTurn(SID, "a", MODEL, "low", 5_000);
+  await tick(5);
+  c.stopSync();
+  c.onChildExit(child, null, "SIGKILL");
+  const r = await t;
+  assert.match(r.error.message, /^app-server stopped \(SIGKILL\)$/);
+});
